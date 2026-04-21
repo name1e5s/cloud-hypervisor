@@ -9,10 +9,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
-use crate::config::{
-    ConsoleOutputMode, DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig,
-    VdpaConfig, VhostMode, VmConfig, VsockConfig,
-};
+
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::LegacyUserspaceInterruptManager;
 use crate::interrupt::MsiInterruptManager;
@@ -21,6 +18,10 @@ use crate::pci_segment::PciSegment;
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 use crate::sigwinch_listener::start_sigwinch_listener;
+use crate::vm_config::{
+    ConsoleOutputMode, DeviceConfig, DiskConfig, FsConfig, IvshmemConfig, NetConfig, PmemConfig,
+    UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
+};
 use crate::GuestRegionMmap;
 use crate::PciDeviceInfo;
 use crate::{device_node, DEVICE_MANAGER_SNAPSHOT_ID};
@@ -50,6 +51,7 @@ use devices::{
     interrupt_controller, interrupt_controller::InterruptController, AcpiNotificationFlags,
 };
 use hypervisor::{HypervisorType, IoEventAddress};
+use libc::EFD_NONBLOCK;
 use libc::{
     cfmakeraw, isatty, tcgetattr, tcsetattr, termios, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED,
     O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW,
@@ -74,8 +76,10 @@ use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::task::JoinHandle;
 use tracer::trace_scoped;
 use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd};
+use virtio_devices::fs::{BackendFsConfig, FsEvent};
 use virtio_devices::transport::VirtioTransport;
 use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator};
 use virtio_devices::vhost_user::VhostUserConfig;
@@ -96,8 +100,8 @@ use vm_memory::{Address, GuestAddress, GuestUsize, MmapRegion};
 #[cfg(target_arch = "x86_64")]
 use vm_memory::{GuestAddressSpace, GuestMemory};
 use vm_migration::{
-    protocol::MemoryRangeTable, snapshot_from_id, versioned_state_from_id, Migratable,
-    MigratableError, Pausable, Snapshot, SnapshotDataSection, Snapshottable, Transportable,
+    protocol::MemoryRangeTable, snapshot_from_id, state_from_id, Migratable, MigratableError,
+    Pausable, Snapshot, SnapshotDataSection, Snapshottable, Transportable,
 };
 use vm_virtio::AccessPlatform;
 use vm_virtio::VirtioDeviceType;
@@ -116,6 +120,10 @@ const RNG_DEVICE_NAME: &str = "__rng";
 const IOMMU_DEVICE_NAME: &str = "__iommu";
 const BALLOON_DEVICE_NAME: &str = "__balloon";
 const CONSOLE_DEVICE_NAME: &str = "__console";
+const PVPANIC_DEVICE_NAME: &str = "__pvpanic";
+const IVSHMEM_DEVICE_NAME: &str = "__ivshmem";
+#[cfg(target_arch = "x86_64")]
+const SYS_CTRL_DEVICE_NAME: &str = "__sys_ctrl";
 
 // Devices that the user may name and for which we generate
 // identifiers if the user doesn't give one
@@ -129,6 +137,7 @@ const WATCHDOG_DEVICE_NAME: &str = "__watchdog";
 const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
 const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
 const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
+const MAX_WORKER_THREADS: usize = 5;
 
 /// Errors associated with device manager
 #[derive(Debug)]
@@ -156,6 +165,9 @@ pub enum DeviceManagerError {
 
     /// Cannot create virtio-fs device
     CreateVirtioFs(virtio_devices::vhost_user::Error),
+
+    /// Cannot create native virtio-fs device
+    CreateNativeVirtioFs(io::Error),
 
     /// Virtio-fs device was created without a socket.
     NoVirtioFsSock,
@@ -472,6 +484,14 @@ pub enum DeviceManagerError {
 
     /// Failed retrieving device state from snapshot
     RestoreGetState(MigratableError),
+
+    /// Cannot create a PvPanic device
+    PvPanicCreate(devices::pvpanic::PvPanicError),
+    /// Channle recv error.
+    VirtioFsServerRecv(std::sync::mpsc::RecvError),
+
+    /// Virtio-Fs server update filter failed.
+    VirtioFsServerUpdate(String),
 }
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
 
@@ -479,6 +499,8 @@ const DEVICE_MANAGER_ACPI_SIZE: usize = 0x10;
 
 const TIOCSPTLCK: libc::c_int = 0x4004_5431;
 const TIOCGTPEER: libc::c_int = 0x5441;
+
+// const IVSHMEM_START_ADDR: u64 = 0x8000_0000;
 
 pub fn create_pty() -> io::Result<(File, File, PathBuf)> {
     // Try to use /dev/pts/ptmx first then fall back to /dev/ptmx
@@ -538,6 +560,14 @@ pub struct Console {
 }
 
 impl Console {
+    pub fn need_resize(&self) -> bool {
+        if let Some(_resizer) = self.console_resizer.as_ref() {
+            return true;
+        }
+
+        false
+    }
+
     pub fn update_console_size(&self) {
         if let Some(resizer) = self.console_resizer.as_ref() {
             resizer.update_console_size()
@@ -926,6 +956,9 @@ pub struct DeviceManager {
     // GPIO device for AArch64
     gpio_device: Option<Arc<Mutex<devices::legacy::Gpio>>>,
 
+    // pvpanic device
+    pvpanic_device: Option<Arc<Mutex<devices::PvPanicDevice>>>,
+
     // Flag to force setting the iommu on virtio devices
     force_iommu: bool,
 
@@ -948,6 +981,14 @@ pub struct DeviceManager {
     acpi_platform_addresses: AcpiPlatformAddresses,
 
     snapshot: Option<Snapshot>,
+
+    sandbox_id: String,
+
+    #[cfg(target_arch = "x86_64")]
+    sys_ctrl: Option<Arc<Mutex<devices::legacy::SysCtrl>>>,
+
+    // ivshmem device
+    ivshmem_device: Option<Arc<Mutex<devices::IvshmemDevice>>>,
 }
 
 impl DeviceManager {
@@ -967,6 +1008,7 @@ impl DeviceManager {
         boot_id_list: BTreeSet<String>,
         timestamp: Instant,
         snapshot: Option<Snapshot>,
+        sandbox_id: String,
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
         trace_scoped!("DeviceManager::new");
 
@@ -1087,6 +1129,7 @@ impl DeviceManager {
             virtio_mem_devices: Vec::new(),
             #[cfg(target_arch = "aarch64")]
             gpio_device: None,
+            pvpanic_device: None,
             force_iommu,
             restoring,
             io_uring_supported: None,
@@ -1095,6 +1138,10 @@ impl DeviceManager {
             pending_activations: Arc::new(Mutex::new(Vec::default())),
             acpi_platform_addresses: AcpiPlatformAddresses::default(),
             snapshot,
+            sandbox_id,
+            #[cfg(target_arch = "x86_64")]
+            sys_ctrl: None,
+            ivshmem_device: None,
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -1125,6 +1172,49 @@ impl DeviceManager {
 
     pub fn console_resize_pipe(&self) -> Option<Arc<File>> {
         self.console_resize_pipe.as_ref().map(Arc::clone)
+    }
+
+    pub fn fs_device_update(&self, fs_cfg: FsConfig) -> DeviceManagerResult<()> {
+        if let Some(id) = fs_cfg.id {
+            let device_tree = self.device_tree.lock().unwrap();
+            let node = device_tree
+                .get(&id)
+                .ok_or(DeviceManagerError::UnknownDeviceId(id))?;
+            let mut channel_wait = false;
+            let (tx, rx): (
+                std::sync::mpsc::Sender<bool>,
+                std::sync::mpsc::Receiver<bool>,
+            ) = std::sync::mpsc::channel();
+            if node.dev_fd.is_some()
+                && node.pending_dev_message.is_some()
+                && fs_cfg.backendfs_config.is_some()
+            {
+                let mut pending_dev_message =
+                    node.pending_dev_message.as_ref().unwrap().lock().unwrap();
+                let event = FsEvent {
+                    tx,
+                    backendfs_config: fs_cfg.backendfs_config.unwrap(),
+                };
+                pending_dev_message.push(event);
+                // SAFETY: FFI call to dup. Trivially safe.
+                let dev_fd = unsafe { libc::dup(node.dev_fd.unwrap()) };
+                // SAFETY: dev_fd is valid and owned solely by us.
+                let dev_evt = unsafe { EventFd::from_raw_fd(dev_fd) };
+                dev_evt.write(1).unwrap();
+                channel_wait = true;
+            }
+            if channel_wait {
+                debug!("Waiting on channel");
+                let success = rx.recv().map_err(DeviceManagerError::VirtioFsServerRecv)?;
+                if !success {
+                    return Err(DeviceManagerError::VirtioFsServerUpdate(
+                        "failed to update filter list".into(),
+                    ));
+                }
+                debug!("Waiting finished with {:?}", success);
+            }
+        }
+        Ok(())
     }
 
     pub fn create_devices(
@@ -1161,8 +1251,9 @@ impl DeviceManager {
         }
 
         #[cfg(target_arch = "x86_64")]
+        // WORKAROUND: force reset event into shutdown.
         self.add_legacy_devices(
-            self.reset_evt
+            self.exit_evt
                 .try_clone()
                 .map_err(DeviceManagerError::EventFd)?,
         )?;
@@ -1171,9 +1262,10 @@ impl DeviceManager {
         self.add_legacy_devices(&legacy_interrupt_manager)?;
 
         {
+            // WORKAROUND: force reset event into shutdown.
             self.ged_notification_device = self.add_acpi_devices(
                 &legacy_interrupt_manager,
-                self.reset_evt
+                self.exit_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
                 self.exit_evt
@@ -1202,6 +1294,14 @@ impl DeviceManager {
         self.add_pci_devices(virtio_devices.clone())?;
 
         self.virtio_devices = virtio_devices;
+
+        if self.config.clone().lock().unwrap().pvpanic {
+            self.pvpanic_device = self.add_pvpanic_device()?;
+        }
+
+        if let Some(ivshmem) = self.config.clone().lock().unwrap().ivshmem.as_ref() {
+            self.ivshmem_device = self.add_ivshmem_device(ivshmem)?;
+        }
 
         Ok(())
     }
@@ -1253,7 +1353,7 @@ impl DeviceManager {
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
                 self.get_msi_iova_space(),
-                versioned_state_from_id(self.snapshot.as_ref(), iommu_id.as_str())
+                state_from_id(self.snapshot.as_ref(), iommu_id.as_str())
                     .map_err(DeviceManagerError::RestoreGetState)?,
             )
             .map_err(DeviceManagerError::CreateVirtioIommu)?;
@@ -1565,6 +1665,32 @@ impl DeviceManager {
             .io_bus
             .insert(debug_port, 0x80, 0x1)
             .map_err(DeviceManagerError::BusError)?;
+
+        // 0x0680 system control port
+        #[cfg(target_arch = "x86_64")]
+        if self.config.lock().unwrap().sys_ctrl {
+            let id = String::from(SYS_CTRL_DEVICE_NAME);
+            let sys_ctrl = Arc::new(Mutex::new(devices::legacy::SysCtrl::new(
+                id.clone(),
+                state_from_id(self.snapshot.as_ref(), id.as_str())
+                    .map_err(DeviceManagerError::RestoreGetState)?,
+            )));
+            self.sys_ctrl = Some(Arc::clone(&sys_ctrl));
+            self.bus_devices
+                .push(Arc::clone(&sys_ctrl) as Arc<Mutex<dyn BusDevice>>);
+            self.address_manager
+                .io_bus
+                .insert(
+                    Arc::clone(&sys_ctrl) as Arc<Mutex<dyn BusDevice>>,
+                    0x680,
+                    0x1,
+                )
+                .map_err(DeviceManagerError::BusError)?;
+            self.device_tree
+                .lock()
+                .unwrap()
+                .insert(id.clone(), device_node!(id, sys_ctrl));
+        }
 
         Ok(())
     }
@@ -1903,7 +2029,7 @@ impl DeviceManager {
             self.exit_evt
                 .try_clone()
                 .map_err(DeviceManagerError::EventFd)?,
-            versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
+            state_from_id(self.snapshot.as_ref(), id.as_str())
                 .map_err(DeviceManagerError::RestoreGetState)?,
         )
         .map_err(DeviceManagerError::CreateVirtioConsole)?;
@@ -1926,11 +2052,13 @@ impl DeviceManager {
             .insert(id.clone(), device_node!(id, virtio_console_device));
 
         // Only provide a resizer (for SIGWINCH handling) if the console is attached to the TTY
-        Ok(if matches!(console_config.mode, ConsoleOutputMode::Tty) {
-            Some(console_resizer)
-        } else {
-            None
-        })
+        Ok(
+            if matches!(console_config.mode, ConsoleOutputMode::Tty) && console_config.sigwinch {
+                Some(console_resizer)
+            } else {
+                None
+            },
+        )
     }
 
     fn add_console_device(
@@ -2073,8 +2201,6 @@ impl DeviceManager {
 
         info!("Creating virtio-block device: {:?}", disk_cfg);
 
-        let snapshot = snapshot_from_id(self.snapshot.as_ref(), id.as_str());
-
         let (virtio_device, migratable_device) = if disk_cfg.vhost_user {
             let socket = disk_cfg.vhost_socket.as_ref().unwrap().clone();
             let vu_cfg = VhostUserConfig {
@@ -2091,9 +2217,7 @@ impl DeviceManager {
                         .try_clone()
                         .map_err(DeviceManagerError::EventFd)?,
                     self.force_iommu,
-                    snapshot
-                        .map(|s| s.to_versioned_state(&id))
-                        .transpose()
+                    state_from_id(self.snapshot.as_ref(), id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
                 ) {
                     Ok(vub_device) => vub_device,
@@ -2190,9 +2314,7 @@ impl DeviceManager {
                     self.exit_evt
                         .try_clone()
                         .map_err(DeviceManagerError::EventFd)?,
-                    snapshot
-                        .map(|s| s.to_versioned_state(&id))
-                        .transpose()
+                    state_from_id(self.snapshot.as_ref(), id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
                 )
                 .map_err(DeviceManagerError::CreateVirtioBlock)?,
@@ -2248,8 +2370,6 @@ impl DeviceManager {
         };
         info!("Creating virtio-net device: {:?}", net_cfg);
 
-        let snapshot = snapshot_from_id(self.snapshot.as_ref(), id.as_str());
-
         let (virtio_device, migratable_device) = if net_cfg.vhost_user {
             let socket = net_cfg.vhost_socket.as_ref().unwrap().clone();
             let vu_cfg = VhostUserConfig {
@@ -2273,9 +2393,7 @@ impl DeviceManager {
                         .try_clone()
                         .map_err(DeviceManagerError::EventFd)?,
                     self.force_iommu,
-                    snapshot
-                        .map(|s| s.to_versioned_state(&id))
-                        .transpose()
+                    state_from_id(self.snapshot.as_ref(), id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
                 ) {
                     Ok(vun_device) => vun_device,
@@ -2290,9 +2408,7 @@ impl DeviceManager {
                 vhost_user_net as Arc<Mutex<dyn Migratable>>,
             )
         } else {
-            let state = snapshot
-                .map(|s| s.to_versioned_state(&id))
-                .transpose()
+            let state = state_from_id(self.snapshot.as_ref(), id.as_str())
                 .map_err(DeviceManagerError::RestoreGetState)?;
 
             let virtio_net = if let Some(ref tap_if_name) = net_cfg.tap {
@@ -2314,6 +2430,7 @@ impl DeviceManager {
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,
                         state,
+                        Some(self.sandbox_id.clone()),
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
@@ -2354,6 +2471,7 @@ impl DeviceManager {
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,
                         state,
+                        None,
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
@@ -2414,7 +2532,7 @@ impl DeviceManager {
                     self.exit_evt
                         .try_clone()
                         .map_err(DeviceManagerError::EventFd)?,
-                    versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
+                    state_from_id(self.snapshot.as_ref(), id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
                 )
                 .map_err(DeviceManagerError::CreateVirtioRng)?,
@@ -2440,6 +2558,96 @@ impl DeviceManager {
         Ok(devices)
     }
 
+    fn make_vhost_virtio_fs_device(
+        &mut self,
+        id: String,
+        mut node: DeviceNode,
+        fs_cfg: &FsConfig,
+    ) -> DeviceManagerResult<MetaVirtioDevice> {
+        let virtio_fs_device;
+        if let Some(fs_socket) = fs_cfg.socket.to_str() {
+            virtio_fs_device = Arc::new(Mutex::new(
+                virtio_devices::vhost_user::Fs::new(
+                    id.clone(),
+                    fs_socket,
+                    &fs_cfg.tag,
+                    fs_cfg.num_queues,
+                    fs_cfg.queue_size,
+                    None,
+                    self.seccomp_action.clone(),
+                    self.exit_evt
+                        .try_clone()
+                        .map_err(DeviceManagerError::EventFd)?,
+                    self.force_iommu,
+                    state_from_id(self.snapshot.as_ref(), id.as_str())
+                        .map_err(DeviceManagerError::RestoreGetState)?,
+                )
+                .map_err(DeviceManagerError::CreateVirtioFs)?,
+            ));
+        } else {
+            return Err(DeviceManagerError::NoVirtioFsSock);
+        }
+
+        // Update the device tree with the migratable device.
+        node.migratable = Some(Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>);
+        self.device_tree.lock().unwrap().insert(id.clone(), node);
+        Ok(MetaVirtioDevice {
+            virtio_device: Arc::clone(&virtio_fs_device)
+                as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
+            iommu: false,
+            id,
+            pci_segment: fs_cfg.pci_segment,
+            dma_handler: None,
+        })
+    }
+
+    fn make_native_virtio_fs_device(
+        &mut self,
+        id: String,
+        mut node: DeviceNode,
+        fs_cfg: &FsConfig,
+        bfs_cfg: &BackendFsConfig,
+    ) -> DeviceManagerResult<MetaVirtioDevice> {
+        let dev_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let dev_fd = dev_evt.as_raw_fd();
+        let pending_dev_message = Arc::new(Mutex::new(Vec::default()));
+        let virtio_fs_device = Arc::new(Mutex::new(
+            virtio_devices::Fs::new(
+                id.clone(),
+                &fs_cfg.tag,
+                fs_cfg.num_queues,
+                fs_cfg.queue_size,
+                self.seccomp_action.clone(),
+                self.exit_evt
+                    .try_clone()
+                    .map_err(DeviceManagerError::EventFd)?,
+                self.force_iommu,
+                state_from_id(self.snapshot.as_ref(), id.as_str())
+                    .map_err(DeviceManagerError::RestoreGetState)?,
+                bfs_cfg,
+                None,
+                fs_cfg.rate_limiter_config,
+                dev_evt,
+                pending_dev_message.clone(),
+            )
+            .map_err(DeviceManagerError::CreateNativeVirtioFs)?,
+        ));
+
+        // Update the device tree with the migratable device.
+        node.migratable = Some(Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>);
+        node.dev_fd = Some(dev_fd);
+        node.pending_dev_message = Some(pending_dev_message);
+        self.device_tree.lock().unwrap().insert(id.clone(), node);
+        Ok(MetaVirtioDevice {
+            virtio_device: Arc::clone(&virtio_fs_device)
+                as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
+            iommu: false,
+            id,
+            pci_segment: fs_cfg.pci_segment,
+            dma_handler: None,
+        })
+    }
+
     fn make_virtio_fs_device(
         &mut self,
         fs_cfg: &mut FsConfig,
@@ -2454,42 +2662,12 @@ impl DeviceManager {
 
         info!("Creating virtio-fs device: {:?}", fs_cfg);
 
-        let mut node = device_node!(id);
+        let node = device_node!(id);
 
-        if let Some(fs_socket) = fs_cfg.socket.to_str() {
-            let virtio_fs_device = Arc::new(Mutex::new(
-                virtio_devices::vhost_user::Fs::new(
-                    id.clone(),
-                    fs_socket,
-                    &fs_cfg.tag,
-                    fs_cfg.num_queues,
-                    fs_cfg.queue_size,
-                    None,
-                    self.seccomp_action.clone(),
-                    self.exit_evt
-                        .try_clone()
-                        .map_err(DeviceManagerError::EventFd)?,
-                    self.force_iommu,
-                    versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
-                        .map_err(DeviceManagerError::RestoreGetState)?,
-                )
-                .map_err(DeviceManagerError::CreateVirtioFs)?,
-            ));
-
-            // Update the device tree with the migratable device.
-            node.migratable = Some(Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>);
-            self.device_tree.lock().unwrap().insert(id.clone(), node);
-
-            Ok(MetaVirtioDevice {
-                virtio_device: Arc::clone(&virtio_fs_device)
-                    as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
-                iommu: false,
-                id,
-                pci_segment: fs_cfg.pci_segment,
-                dma_handler: None,
-            })
+        if let Some(bfs_cfg) = &fs_cfg.backendfs_config {
+            self.make_native_virtio_fs_device(id, node, fs_cfg, bfs_cfg)
         } else {
-            Err(DeviceManagerError::NoVirtioFsSock)
+            self.make_vhost_virtio_fs_device(id, node, fs_cfg)
         }
     }
 
@@ -2526,7 +2704,7 @@ impl DeviceManager {
         // Look for the id in the device tree. If it can be found, that means
         // the device is being restored, otherwise it's created from scratch.
         let region_range = if let Some(node) = self.device_tree.lock().unwrap().get(&id) {
-            info!("Restoring virtio-pmem {} resources", id);
+            debug!("Restoring virtio-pmem {} resources", id);
 
             let mut region_range: Option<(u64, u64)> = None;
             for resource in node.resources.iter() {
@@ -2654,7 +2832,7 @@ impl DeviceManager {
                 self.exit_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
-                versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
+                state_from_id(self.snapshot.as_ref(), id.as_str())
                     .map_err(DeviceManagerError::RestoreGetState)?,
             )
             .map_err(DeviceManagerError::CreateVirtioPmem)?,
@@ -2704,6 +2882,7 @@ impl DeviceManager {
             vsock_cfg.id = Some(id.clone());
             id
         };
+        let backend_id = format!("{id}-backend");
 
         info!("Creating virtio-vsock device: {:?}", vsock_cfg);
 
@@ -2711,9 +2890,17 @@ impl DeviceManager {
             .socket
             .to_str()
             .ok_or(DeviceManagerError::CreateVsockConvertPath)?;
-        let backend =
-            virtio_devices::vsock::VsockUnixBackend::new(vsock_cfg.cid, socket_path.to_string())
-                .map_err(DeviceManagerError::CreateVsockBackend)?;
+
+        let vsock_snapshot = snapshot_from_id(self.snapshot.as_ref(), id.as_str());
+        let backend = virtio_devices::vsock::VsockUnixBackend::new(
+            backend_id.clone(),
+            vsock_cfg.cid,
+            socket_path.to_string(),
+            vsock_cfg.muxer_epoll_nested,
+            state_from_id(vsock_snapshot.as_ref(), backend_id.as_str())
+                .map_err(DeviceManagerError::RestoreGetState)?,
+        )
+        .map_err(DeviceManagerError::CreateVsockBackend)?;
 
         let vsock_device = Arc::new(Mutex::new(
             virtio_devices::Vsock::new(
@@ -2726,7 +2913,7 @@ impl DeviceManager {
                 self.exit_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
-                versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
+                state_from_id(self.snapshot.as_ref(), id.as_str())
                     .map_err(DeviceManagerError::RestoreGetState)?,
             )
             .map_err(DeviceManagerError::CreateVirtioVsock)?,
@@ -2786,7 +2973,7 @@ impl DeviceManager {
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,
                         virtio_mem_zone.blocks_state().clone(),
-                        versioned_state_from_id(self.snapshot.as_ref(), memory_zone_id.as_str())
+                        state_from_id(self.snapshot.as_ref(), memory_zone_id.as_str())
                             .map_err(DeviceManagerError::RestoreGetState)?,
                     )
                     .map_err(DeviceManagerError::CreateVirtioMem)?,
@@ -2838,7 +3025,7 @@ impl DeviceManager {
                     self.exit_evt
                         .try_clone()
                         .map_err(DeviceManagerError::EventFd)?,
-                    versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
+                    state_from_id(self.snapshot.as_ref(), id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
                 )
                 .map_err(DeviceManagerError::CreateVirtioBalloon)?,
@@ -2882,7 +3069,7 @@ impl DeviceManager {
                 self.exit_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
-                versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
+                state_from_id(self.snapshot.as_ref(), id.as_str())
                     .map_err(DeviceManagerError::RestoreGetState)?,
             )
             .map_err(DeviceManagerError::CreateVirtioWatchdog)?,
@@ -2929,7 +3116,7 @@ impl DeviceManager {
                 device_path,
                 self.memory_manager.lock().unwrap().guest_memory(),
                 vdpa_cfg.num_queues as u16,
-                versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
+                state_from_id(self.snapshot.as_ref(), id.as_str())
                     .map_err(DeviceManagerError::RestoreGetState)?,
             )
             .map_err(DeviceManagerError::CreateVdpa)?,
@@ -3512,6 +3699,119 @@ impl DeviceManager {
         Ok(pci_device_bdf)
     }
 
+    fn add_pvpanic_device(
+        &mut self,
+    ) -> DeviceManagerResult<Option<Arc<Mutex<devices::PvPanicDevice>>>> {
+        let id = String::from(PVPANIC_DEVICE_NAME);
+        let pci_segment_id = 0x0_u16;
+
+        info!("Creating pvpanic device {}", id);
+
+        let (pci_segment_id, pci_device_bdf, resources) =
+            self.pci_resources(&id, pci_segment_id)?;
+
+        let pvpanic_device = devices::PvPanicDevice::new(
+            id.clone(),
+            state_from_id(self.snapshot.as_ref(), id.as_str())
+                .map_err(DeviceManagerError::RestoreGetState)?,
+        )
+        .map_err(DeviceManagerError::PvPanicCreate)?;
+
+        let pvpanic_device = Arc::new(Mutex::new(pvpanic_device));
+
+        let new_resources = self.add_pci_device(
+            pvpanic_device.clone(),
+            pvpanic_device.clone(),
+            pci_segment_id,
+            pci_device_bdf,
+            resources,
+        )?;
+
+        let mut node = device_node!(id, pvpanic_device);
+
+        node.resources = new_resources;
+        node.pci_bdf = Some(pci_device_bdf);
+        node.pci_device_handle = None;
+
+        self.device_tree.lock().unwrap().insert(id, node);
+
+        Ok(Some(pvpanic_device))
+    }
+
+    fn add_ivshmem_device(
+        &mut self,
+        ivshmem_cfg: &IvshmemConfig,
+    ) -> DeviceManagerResult<Option<Arc<Mutex<devices::IvshmemDevice>>>> {
+        let id = String::from(IVSHMEM_DEVICE_NAME);
+        let pci_segment_id = 0x0_u16;
+        info!("Creating ivshmem device {}", id);
+
+        let (pci_segment_id, pci_device_bdf, resources) =
+            self.pci_resources(&id, pci_segment_id)?;
+
+        let ivshmem_device = Arc::new(Mutex::new(devices::IvshmemDevice::new(
+            id.clone(),
+            state_from_id(self.snapshot.as_ref(), id.as_str())
+                .map_err(DeviceManagerError::RestoreGetState)?,
+            ivshmem_cfg.size as u64,
+        )));
+        let new_resources = self.add_pci_device(
+            ivshmem_device.clone(),
+            ivshmem_device.clone(),
+            pci_segment_id,
+            pci_device_bdf,
+            resources,
+        )?;
+
+        let start_addr = ivshmem_device.lock().unwrap().data_bar_addr();
+        let region = MemoryManager::create_ram_region(
+            &Some(ivshmem_cfg.path.clone()),
+            0,
+            GuestAddress(start_addr),
+            ivshmem_cfg.size,
+            false,
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            0,
+            false,
+        )
+        .map_err(DeviceManagerError::MemoryManager)?;
+        let mem_slot = self
+            .memory_manager
+            .lock()
+            .unwrap()
+            .create_userspace_mapping(
+                region.start_addr().0,
+                region.len(),
+                region.as_ptr() as u64,
+                false,
+                false,
+                false,
+            )
+            .map_err(DeviceManagerError::MemoryManager)?;
+        let _mapping = virtio_devices::UserspaceMapping {
+            host_addr: region.as_ptr() as u64,
+            mem_slot,
+            addr: GuestAddress(region.start_addr().0),
+            len: region.len(),
+            mergeable: false,
+        };
+        ivshmem_device.lock().unwrap().assign_region(region);
+
+        let mut node = device_node!(id, ivshmem_device);
+        node.resources = new_resources;
+        node.pci_bdf = Some(pci_device_bdf);
+        node.pci_device_handle = None;
+        self.device_tree.lock().unwrap().insert(id, node);
+
+        Ok(Some(ivshmem_device))
+    }
+
+
     fn pci_resources(
         &self,
         id: &str,
@@ -3521,7 +3821,7 @@ impl DeviceManager {
         // the device is being restored, otherwise it's created from scratch.
         Ok(
             if let Some(node) = self.device_tree.lock().unwrap().get(id) {
-                info!("Restoring virtio-pci {} resources", id);
+                debug!("Restoring virtio-pci {} resources", id);
                 let pci_device_bdf: PciBdf = node
                     .pci_bdf
                     .ok_or(DeviceManagerError::MissingDeviceNodePciBdf)?;
@@ -4092,6 +4392,67 @@ impl DeviceManager {
         self.device_tree.clone()
     }
 
+    pub fn sys_started(&self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(sys_ctrl) = &self.sys_ctrl {
+            return sys_ctrl.clone().lock().unwrap().sys_started();
+        }
+
+        true
+    }
+
+    pub fn restore_device_node(
+        &mut self,
+        device_groups: (Vec<DeviceNode>, Vec<DeviceNode>),
+        snapshot: Snapshot,
+    ) -> std::result::Result<(), MigratableError> {
+        let total_nodes = device_groups.0.len() + device_groups.1.len();
+        let work_thread_num = if total_nodes > MAX_WORKER_THREADS {
+            MAX_WORKER_THREADS
+        } else {
+            total_nodes
+        };
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(work_thread_num)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            // Process device groups in order to ensure correct restoration sequence
+            let groups = [device_groups.0, device_groups.1];
+            for nodes in groups {
+                let mut thread_pool: Vec<JoinHandle<Result<(), MigratableError>>> = vec![];
+
+                for node in nodes {
+                    if let Some(migratable) = node.migratable {
+                        debug!("Restoring {} from DeviceManager", node.id);
+                        if let Some(snapshot) = snapshot.snapshots.get(&node.id).cloned() {
+                            thread_pool.push(tokio::spawn(async move {
+                                let mut guard = migratable.lock().unwrap();
+                                guard.pause()?;
+                                guard.restore(*snapshot)?;
+                                Ok(())
+                            }));
+                        } else {
+                            return Err(MigratableError::Restore(anyhow!(
+                                "Missing device {}",
+                                node.id
+                            )));
+                        }
+                    }
+                }
+
+                // Wait for all devices in current group to complete before processing next group
+                for t in thread_pool {
+                    t.await.unwrap()?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn restore_devices(
         &mut self,
         snapshot: Snapshot,
@@ -4100,27 +4461,26 @@ impl DeviceManager {
         // It's important to restore devices in the right order, that's why
         // the device tree is the right way to ensure we restore a child before
         // its parent node.
-        for node in self
+        let devices_children: Vec<_> = self
             .device_tree
             .lock()
             .unwrap()
-            .breadth_first_traversal()
+            .breadth_first_traversal_children()
             .rev()
-        {
-            // Restore the node
-            if let Some(migratable) = &node.migratable {
-                info!("Restoring {} from DeviceManager", node.id);
-                if let Some(snapshot) = snapshot.snapshots.get(&node.id) {
-                    migratable.lock().unwrap().pause()?;
-                    migratable.lock().unwrap().restore(*snapshot.clone())?;
-                } else {
-                    return Err(MigratableError::Restore(anyhow!(
-                        "Missing device {}",
-                        node.id
-                    )));
-                }
-            }
-        }
+            .cloned()
+            .collect();
+
+        let devices_parent: Vec<_> = self
+            .device_tree
+            .lock()
+            .unwrap()
+            .breadth_first_traversal_parent()
+            .rev()
+            .cloned()
+            .collect();
+
+        let device_groups = (devices_children, devices_parent);
+        self.restore_device_node(device_groups, snapshot)?;
 
         // The devices have been fully restored, we can now update the
         // restoring state of the DeviceManager.
@@ -4437,15 +4797,55 @@ impl Snapshottable for DeviceManager {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        let mut snapshot = Snapshot::new(DEVICE_MANAGER_SNAPSHOT_ID);
-
         // We aggregate all devices snapshots.
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
-            if let Some(migratable) = &device_node.migratable {
-                let device_snapshot = migratable.lock().unwrap().snapshot()?;
-                snapshot.add_snapshot(device_snapshot);
+        let devices: Vec<_> = self
+            .device_tree
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, node)| node.clone())
+            .collect();
+
+        let work_thread_num = if devices.len() > MAX_WORKER_THREADS {
+            MAX_WORKER_THREADS
+        } else {
+            // always greater than 0
+            devices.len()
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(work_thread_num)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut snapshot = rt.block_on(async move {
+            let snapshot = Arc::new(tokio::sync::Mutex::new(Snapshot::new(
+                DEVICE_MANAGER_SNAPSHOT_ID,
+            )));
+            let mut thread_pool = vec![];
+
+            for device_node in devices.into_iter() {
+                if let Some(migratable) = device_node.migratable {
+                    let snapshot_arc = snapshot.clone();
+                    thread_pool.push(tokio::spawn(async move {
+                        // sync::Mutex is safe since vm has been paused and vmm action is serial.
+                        let device_snapshot = migratable.lock().unwrap().snapshot()?;
+                        snapshot_arc.lock().await.add_snapshot(device_snapshot);
+                        Ok(())
+                    }));
+                }
             }
-        }
+            for t in thread_pool {
+                t.await.unwrap()?;
+            }
+            if let Ok(mutex) = Arc::try_unwrap(snapshot) {
+                Ok(mutex.into_inner())
+            } else {
+                Err(MigratableError::Snapshot(anyhow!(
+                    "Could not unwrap snapshot mutex"
+                )))
+            }
+        })?;
 
         // Then we store the DeviceManager state.
         snapshot.add_data_section(SnapshotDataSection::new_from_state(
@@ -4622,6 +5022,12 @@ impl BusDevice for DeviceManager {
 
 impl Drop for DeviceManager {
     fn drop(&mut self) {
+        // Wake up the DeviceManager threads (mainly virtio device workers),
+        // to avoid deadlock on waiting for paused/parked worker threads.
+        if let Err(e) = self.resume() {
+            error!("Error resuming DeviceManager: {:?}", e);
+        }
+
         for handle in self.virtio_devices.drain(..) {
             handle.virtio_device.lock().unwrap().shutdown();
         }

@@ -11,12 +11,8 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
-use crate::config::{
-    add_to_config, DeviceConfig, DiskConfig, FsConfig, HotplugMethod, NetConfig, PmemConfig,
-    UserDeviceConfig, ValidationError, VdpaConfig, VmConfig, VsockConfig,
-};
-use crate::config::{NumaConfig, PayloadConfig};
-#[cfg(feature = "guest_debug")]
+use crate::config::{add_to_config, ValidationError};
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
     CpuElf64Writable, DumpState, Elf64Writable, GuestDebuggable, GuestDebuggableError, NoteDescType,
 };
@@ -32,6 +28,12 @@ use crate::memory_manager::{
 use crate::migration::url_to_file;
 use crate::migration::{url_to_path, SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+use crate::vm_config::CompatibleMode;
+use crate::vm_config::{
+    DeviceConfig, DiskConfig, FsConfig, HotplugMethod, NetConfig, NumaConfig, PayloadConfig,
+    PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+};
 use crate::GuestMemoryMmap;
 use crate::{
     PciDeviceInfo, CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, MEMORY_MANAGER_SNAPSHOT_ID,
@@ -51,10 +53,12 @@ use devices::gic::{Gic, GIC_V3_ITS_SNAPSHOT_ID};
 #[cfg(target_arch = "aarch64")]
 use devices::interrupt_controller::{self, InterruptController};
 use devices::AcpiNotificationFlags;
+use event_notifier::{event_notify, NotifyEvent};
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
+use hypervisor::HypervisorType;
 use hypervisor::{HypervisorVmError, VmOps};
 use linux_loader::cmdline::Cmdline;
 #[cfg(feature = "guest_debug")]
@@ -73,15 +77,14 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
-#[cfg(feature = "tdx")]
-use std::mem;
-#[cfg(feature = "guest_debug")]
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::mem::size_of;
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 use std::{result, str, thread};
 use thiserror::Error;
@@ -90,12 +93,14 @@ use vm_device::Bus;
 #[cfg(target_arch = "x86_64")]
 use vm_device::BusDevice;
 #[cfg(feature = "tdx")]
-use vm_memory::{Address, ByteValued, GuestMemory, GuestMemoryRegion};
-use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
+use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
+use vm_memory::{
+    Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic, WriteVolatile,
+};
 use vm_migration::protocol::{Request, Response, Status};
 use vm_migration::{
     protocol::MemoryRangeTable, snapshot_from_id, Migratable, MigratableError, Pausable, Snapshot,
-    SnapshotDataSection, Snapshottable, Transportable,
+    Snapshottable, Transportable,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
@@ -453,10 +458,21 @@ impl VmOps for VmOpsHandler {
     }
 }
 
-pub fn physical_bits(max_phys_bits: u8) -> u8 {
+pub fn physical_bits(max_phys_bits: u8, hypervisor_type: HypervisorType) -> u8 {
     let host_phys_bits = get_host_cpu_phys_bits();
 
-    cmp::min(host_phys_bits, max_phys_bits)
+    let guest_phys_bits = if matches!(hypervisor_type, HypervisorType::KvmPvm) {
+        cmp::min(max_phys_bits, 43)
+    } else {
+        max_phys_bits
+    };
+
+    debug!(
+        "physical bits {:?} for hypervisor {:?}",
+        guest_phys_bits, hypervisor_type
+    );
+
+    cmp::min(host_phys_bits, guest_phys_bits)
 }
 
 pub struct Vm {
@@ -501,6 +517,8 @@ impl Vm {
         restoring: bool,
         timestamp: Instant,
         snapshot: Option<&Snapshot>,
+        sandbox_id: String,
+        vcpu_started: Arc<AtomicBool>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
 
@@ -549,6 +567,7 @@ impl Vm {
             boot_id_list,
             timestamp,
             snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID),
+            sandbox_id,
         )
         .map_err(Error::DeviceManager)?;
 
@@ -586,6 +605,7 @@ impl Vm {
             #[cfg(feature = "tdx")]
             tdx_enabled,
             &numa_nodes,
+            vcpu_started,
         )
         .map_err(Error::CpuManager)?;
 
@@ -728,6 +748,8 @@ impl Vm {
         serial_pty: Option<PtyPair>,
         console_pty: Option<PtyPair>,
         console_resize_pipe: Option<File>,
+        sandbox_id: String,
+        vcpu_started: Arc<AtomicBool>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -742,7 +764,10 @@ impl Vm {
             tdx_enabled,
         )?;
 
-        let phys_bits = physical_bits(config.lock().unwrap().cpus.max_phys_bits);
+        let phys_bits = physical_bits(
+            config.lock().unwrap().cpus.max_phys_bits,
+            hypervisor.hypervisor_type(),
+        );
 
         #[cfg(target_arch = "x86_64")]
         let sgx_epc_config = config.lock().unwrap().sgx_epc.clone();
@@ -754,6 +779,7 @@ impl Vm {
             phys_bits,
             #[cfg(feature = "tdx")]
             tdx_enabled,
+            None,
             None,
             None,
             #[cfg(target_arch = "x86_64")]
@@ -775,6 +801,8 @@ impl Vm {
             false,
             timestamp,
             None,
+            sandbox_id,
+            vcpu_started,
         )?;
 
         // The device manager must create the devices from here as it is part
@@ -800,6 +828,8 @@ impl Vm {
         seccomp_action: &SeccompAction,
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         activate_evt: EventFd,
+        sandbox_id: String,
+        vcpu_started: Arc<AtomicBool>,
     ) -> Result<Self> {
         let timestamp = Instant::now();
 
@@ -812,7 +842,10 @@ impl Vm {
         let memory_manager = if let Some(memory_manager_snapshot) =
             snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID)
         {
-            let phys_bits = physical_bits(vm_config.lock().unwrap().cpus.max_phys_bits);
+            let phys_bits = physical_bits(
+                vm_config.lock().unwrap().cpus.max_phys_bits,
+                hypervisor.hypervisor_type(),
+            );
             MemoryManager::new_from_snapshot(
                 memory_manager_snapshot,
                 vm.clone(),
@@ -842,6 +875,8 @@ impl Vm {
             true,
             timestamp,
             Some(snapshot),
+            sandbox_id,
+            vcpu_started,
         )
     }
 
@@ -874,7 +909,7 @@ impl Vm {
     }
 
     fn load_initramfs(&mut self, guest_mem: &GuestMemoryMmap) -> Result<arch::InitramfsConfig> {
-        let mut initramfs = self.initramfs.as_ref().unwrap();
+        let initramfs = self.initramfs.as_mut().unwrap();
         let size: usize = initramfs
             .seek(SeekFrom::End(0))
             .map_err(|_| Error::InitramfsLoad)?
@@ -889,7 +924,7 @@ impl Vm {
         let address = GuestAddress(address);
 
         guest_mem
-            .read_from(address, &mut initramfs, size)
+            .read_volatile_from(address, initramfs, size)
             .map_err(|_| Error::InitramfsLoad)?;
 
         info!("Initramfs loaded: address = 0x{:x}", address.0);
@@ -1244,6 +1279,16 @@ impl Vm {
         self.device_manager.lock().unwrap().console_resize_pipe()
     }
 
+    pub fn fs_device_update(&self, fs_cfg: FsConfig) -> Result<()> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .fs_device_update(fs_cfg)
+            .map_err(Error::DeviceManager)?;
+
+        Ok(())
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         let mut state = self.state.try_write().map_err(|_| Error::PoisonedState)?;
         let new_state = VmState::Shutdown;
@@ -1284,8 +1329,13 @@ impl Vm {
         *state = new_state;
 
         event!("vm", "shutdown");
+        event_notify!(NotifyEvent::VmShutdown);
 
         Ok(())
+    }
+
+    pub fn sys_started(&self) -> bool {
+        self.device_manager.lock().unwrap().sys_started()
     }
 
     pub fn resize(
@@ -1321,7 +1371,7 @@ impl Vm {
                 .resize(desired_memory)
                 .map_err(Error::MemoryManager)?;
 
-            let mut memory_config = &mut self.config.lock().unwrap().memory;
+            let memory_config = &mut self.config.lock().unwrap().memory;
 
             if let Some(new_region) = &new_region {
                 self.device_manager
@@ -1827,7 +1877,7 @@ impl Vm {
                     firmware_file
                         .seek(SeekFrom::Start(section.data_offset as u64))
                         .map_err(Error::LoadTdvf)?;
-                    mem.read_from(
+                    mem.read_volatile_from(
                         GuestAddress(section.address),
                         &mut firmware_file,
                         section.data_size as usize,
@@ -1849,13 +1899,8 @@ impl Vm {
                             .map_err(Error::LoadPayload)?;
 
                         let mut payload_header = linux_loader::bootparam::setup_header::default();
-                        payload_header
-                            .as_bytes()
-                            .read_from(
-                                0,
-                                payload_file,
-                                mem::size_of::<linux_loader::bootparam::setup_header>(),
-                            )
+                        payload_file
+                            .read_volatile(&mut payload_header.as_bytes())
                             .unwrap();
 
                         if payload_header.header != 0x5372_6448 {
@@ -1871,7 +1916,7 @@ impl Vm {
                         payload_file
                             .seek(SeekFrom::Start(0))
                             .map_err(Error::LoadPayload)?;
-                        mem.read_from(
+                        mem.read_volatile_from(
                             GuestAddress(section.address),
                             payload_file,
                             payload_size as usize,
@@ -1988,6 +2033,11 @@ impl Vm {
     fn setup_signal_handler(&mut self) -> Result<()> {
         let console = self.device_manager.lock().unwrap().console().clone();
         let signals = Signals::new(Vm::HANDLED_SIGNALS);
+
+        if !console.need_resize() {
+            return Ok(());
+        }
+
         match signals {
             Ok(signals) => {
                 self.signals = Some(signals.handle());
@@ -2353,7 +2403,7 @@ impl Vm {
         fd: &mut F,
     ) -> std::result::Result<(), MigratableError>
     where
-        F: Write,
+        F: WriteVolatile,
     {
         let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
         let mem = guest_memory.memory();
@@ -2367,7 +2417,7 @@ impl Vm {
             // see: https://github.com/rust-vmm/vm-memory/issues/174
             loop {
                 let bytes_written = mem
-                    .write_to(
+                    .write_volatile_to(
                         GuestAddress(range.gpa + offset),
                         fd,
                         (range.length - offset) as usize,
@@ -2587,6 +2637,7 @@ impl Pausable for Vm {
 
         // And we're back to the Running state.
         *state = new_state;
+        info!("vm has been resumed");
         event!("vm", "resumed");
         Ok(())
     }
@@ -2630,29 +2681,41 @@ impl Snapshottable for Vm {
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         let common_cpuid = {
-            let phys_bits = physical_bits(self.config.lock().unwrap().cpus.max_phys_bits);
+            let phys_bits = physical_bits(
+                self.config.lock().unwrap().cpus.max_phys_bits,
+                self.hypervisor.hypervisor_type(),
+            );
+            let cpu_config = &mut self.config.lock().unwrap().cpus;
+
+            let (vendor_compatible, arch_compatible) = match cpu_config.compatible {
+                CompatibleMode::Vendor => (true, false),
+                CompatibleMode::Max => (true, true),
+                CompatibleMode::Ignore => (false, false),
+            };
+
             arch::generate_common_cpuid(
                 self.hypervisor.clone(),
                 None,
                 None,
                 phys_bits,
-                self.config.lock().unwrap().cpus.kvm_hyperv,
+                cpu_config.kvm_hyperv,
                 #[cfg(feature = "tdx")]
                 tdx_enabled,
+                vendor_compatible,
+                arch_compatible,
             )
             .map_err(|e| {
                 MigratableError::MigrateReceive(anyhow!("Error generating common cpuid: {:?}", e))
             })?
         };
 
-        let mut vm_snapshot = Snapshot::new(VM_SNAPSHOT_ID);
-        let vm_snapshot_data = serde_json::to_vec(&VmSnapshot {
+        let vm_snapshot_state = VmSnapshot {
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             clock: self.saved_clock,
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             common_cpuid,
-        })
-        .map_err(|e| MigratableError::Snapshot(e.into()))?;
+        };
+        let mut vm_snapshot = Snapshot::new_from_state(VM_SNAPSHOT_ID, &vm_snapshot_state)?;
 
         vm_snapshot.add_snapshot(self.cpu_manager.lock().unwrap().snapshot()?);
         vm_snapshot.add_snapshot(self.memory_manager.lock().unwrap().snapshot()?);
@@ -2662,10 +2725,6 @@ impl Snapshottable for Vm {
             .map_err(|e| MigratableError::Snapshot(e.into()))?;
 
         vm_snapshot.add_snapshot(self.device_manager.lock().unwrap().snapshot()?);
-        vm_snapshot.add_data_section(SnapshotDataSection {
-            id: format!("{}-section", VM_SNAPSHOT_ID),
-            snapshot: vm_snapshot_data,
-        });
 
         event!("vm", "snapshotted");
         Ok(vm_snapshot)
@@ -2743,6 +2802,7 @@ impl Snapshottable for Vm {
             .map_err(|e| MigratableError::Restore(anyhow!("Could not set VM state: {:#?}", e)))?;
         *state = new_state;
 
+        info!("vm has been restored");
         event!("vm", "restored");
         Ok(())
     }
@@ -2773,6 +2833,11 @@ impl Transportable for Vm {
             .write(vm_config.as_bytes())
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
+        // Ensure config data is flushed to disk for cross-machine pause-snapshot.
+        snapshot_config_file
+            .sync_all()
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
         let mut snapshot_state_path = url_to_path(destination_url)?;
         snapshot_state_path.push(SNAPSHOT_STATE_FILE);
 
@@ -2790,6 +2855,11 @@ impl Transportable for Vm {
 
         snapshot_state_file
             .write(&vm_state)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+        // Ensure state data is flushed to disk for cross-machine pause-snapshot.
+        snapshot_state_file
+            .sync_all()
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         // Tell the memory manager to also send/write its own snapshot.
@@ -3367,18 +3437,30 @@ pub fn test_vm() {
 
     loop {
         match vcpu.run().expect("run failed") {
-            VmExit::IoOut(addr, data) => {
-                println!(
-                    "IO out -- addr: {:#x} data [{:?}]",
-                    addr,
-                    str::from_utf8(data).unwrap()
-                );
-            }
             VmExit::Reset => {
                 println!("HLT");
                 break;
             }
+            VmExit::Ignore => {}
             r => panic!("unexpected exit reason: {:?}", r),
         }
     }
+}
+
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+#[test]
+pub fn test_vm_snapshot_restore() {
+    let vm_snapshot_state = VmSnapshot {
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        clock: Some(hypervisor::ClockData::Kvm(
+            hypervisor::kvm::kvm_clock_data::default(),
+        )),
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        common_cpuid: vec![],
+    };
+
+    let snapshot = Snapshot::new_from_state(VM_SNAPSHOT_ID, &vm_snapshot_state).unwrap();
+
+    let vm_snapshot = get_vm_snapshot(&snapshot).map_err(Error::Restore).unwrap();
+    println!("{:?}", vm_snapshot.clock.unwrap());
 }
