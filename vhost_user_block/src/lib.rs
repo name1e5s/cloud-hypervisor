@@ -32,15 +32,17 @@ use std::vec::Vec;
 use std::{convert, error, fmt, io};
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Listener;
-use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringState, VringT};
+use vhost_user_backend::{
+    bitmap::BitmapMmapRegion, VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringState, VringT,
+};
 use virtio_bindings::bindings::virtio_blk::*;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::QueueT;
 use vm_memory::GuestAddressSpace;
-use vm_memory::{bitmap::AtomicBitmap, ByteValued, Bytes, GuestMemoryAtomic};
+use vm_memory::{ByteValued, Bytes, GuestMemoryAtomic};
 use vmm_sys_util::{epoll::EventSet, eventfd::EventFd};
 
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<BitmapMmapRegion>;
 
 const SECTOR_SHIFT: u8 = 9;
 const SECTOR_SIZE: u64 = 0x01 << SECTOR_SHIFT;
@@ -56,6 +58,7 @@ impl<D: Read + Seek + Write + Send> DiskFile for D {}
 type Result<T> = std::result::Result<T, Error>;
 type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
 
+#[allow(dead_code)]
 #[derive(Debug)]
 enum Error {
     /// Failed to create kill eventfd
@@ -297,9 +300,9 @@ impl VhostUserBlkBackend {
     }
 }
 
-impl VhostUserBackendMut<VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>, AtomicBitmap>
-    for VhostUserBlkBackend
-{
+impl VhostUserBackendMut for VhostUserBlkBackend {
+    type Bitmap = BitmapMmapRegion;
+    type Vring = VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>;
     fn num_queues(&self) -> usize {
         self.config.num_queues as usize
     }
@@ -348,7 +351,7 @@ impl VhostUserBackendMut<VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>, Atomic
         evset: EventSet,
         vrings: &[VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>],
         thread_id: usize,
-    ) -> VhostUserBackendResult<bool> {
+    ) -> VhostUserBackendResult<()> {
         if evset != EventSet::IN {
             return Err(Error::HandleEventNotEpollIn.into());
         }
@@ -392,7 +395,7 @@ impl VhostUserBackendMut<VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>, Atomic
                     thread.process_queue(&mut vring);
                 }
 
-                Ok(false)
+                Ok(())
             }
             _ => Err(Error::HandleEventUnknownEvent.into()),
         }
