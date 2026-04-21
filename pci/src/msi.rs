@@ -5,15 +5,14 @@
 
 use anyhow::anyhow;
 use byteorder::{ByteOrder, LittleEndian};
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::sync::Arc;
 use thiserror::Error;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use vm_device::interrupt::{
     InterruptIndex, InterruptSourceConfig, InterruptSourceGroup, MsiIrqSourceConfig,
 };
-use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable, VersionMapped};
+use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
 
 // MSI control masks
 const MSI_CTL_ENABLE: u16 = 0x1;
@@ -46,7 +45,7 @@ enum Error {
     UpdateInterruptRoute(io::Error),
 }
 
-#[derive(Clone, Copy, Default, Versionize)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct MsiCap {
     // Message Control Register
     //   0:     MSI enable.
@@ -171,12 +170,10 @@ impl MsiCap {
     }
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 struct MsiConfigState {
     cap: MsiCap,
 }
-
-impl VersionMapped for MsiConfigState {}
 
 pub struct MsiConfig {
     pub cap: MsiCap,
@@ -285,11 +282,11 @@ impl Snapshottable for MsiConfig {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id(), &self.state())
+        Snapshot::new_from_state(&self.id(), &self.state())
     }
 
     fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
-        self.set_state(&snapshot.to_versioned_state(&self.id())?)
+        self.set_state(&snapshot.to_state(&self.id())?)
             .map_err(|e| {
                 MigratableError::Restore(anyhow!(
                     "Could not restore state for {}: {:?}",
