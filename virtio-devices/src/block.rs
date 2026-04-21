@@ -23,8 +23,9 @@ use block_util::{
     async_io::AsyncIo, async_io::AsyncIoError, async_io::DiskFile, build_disk_image_id, Request,
     RequestType, VirtioBlockConfig,
 };
-use rate_limiter::{RateLimiter, TokenType};
+use rate_limiter::{BucketReduction, RateLimiter, TokenType};
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::num::Wrapping;
 use std::ops::Deref;
@@ -35,12 +36,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::{collections::HashMap, convert::TryInto};
 use thiserror::Error;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use virtio_bindings::bindings::virtio_blk::*;
+use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryError};
-use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::EventFd;
@@ -75,6 +74,10 @@ pub enum Error {
     QueueIterator(virtio_queue::Error),
     #[error("Failed to update request status: {0}")]
     RequestStatus(GuestMemoryError),
+    #[error("Can't execute an unsupported request")]
+    Unsupported(u32),
+    #[error("Failed to enable notification: {0}")]
+    QueueEnableNotification(virtio_queue::Error),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -85,6 +88,8 @@ pub struct BlockCounters {
     read_ops: Arc<AtomicU64>,
     write_bytes: Arc<AtomicU64>,
     write_ops: Arc<AtomicU64>,
+    limit_by_bytes: Arc<AtomicU64>,
+    limit_by_ops: Arc<AtomicU64>,
 }
 
 struct BlockEpollHandler {
@@ -104,13 +109,16 @@ struct BlockEpollHandler {
     rate_limiter: Option<RateLimiter>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
     read_only: bool,
+    rate_limited: std::sync::Once,
+    id: String,
 }
 
 impl BlockEpollHandler {
-    fn process_queue_submit(&mut self) -> Result<bool> {
+    fn process_queue_submit(&mut self) -> Result<()> {
         let queue = &mut self.queue;
 
-        let mut used_descs = false;
+        let mut limit_by_bytes = Wrapping(0);
+        let mut limit_by_ops = Wrapping(0);
 
         while let Some(mut desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) {
             let mut request = Request::parse(&mut desc_chain, self.access_platform.as_ref())
@@ -133,17 +141,24 @@ impl BlockEpollHandler {
                 queue
                     .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
                     .map_err(Error::QueueAddUsed)?;
-                used_descs = true;
+                queue
+                    .enable_notification(self.mem.memory().deref())
+                    .map_err(Error::QueueEnableNotification)?;
                 continue;
             }
 
             if let Some(rate_limiter) = &mut self.rate_limiter {
                 // If limiter.consume() fails it means there is no more TokenType::Ops
                 // budget and rate limiting is in effect.
-                if !rate_limiter.consume(1, TokenType::Ops) {
+                let rate_limit_reached = rate_limiter.consume(1, TokenType::Ops);
+                if rate_limit_reached != BucketReduction::Success {
                     // Stop processing the queue and return this descriptor chain to the
                     // avail ring, for later processing.
                     queue.go_to_previous_position();
+                    limit_by_ops = Wrapping(1);
+                    self.rate_limited.call_once(||{
+                        info!("{} block ops ratelimit fired", self.id)
+                    });
                     break;
                 }
                 // Exercise the rate limiter only if this request is of data transfer type.
@@ -157,13 +172,28 @@ impl BlockEpollHandler {
 
                     // If limiter.consume() fails it means there is no more TokenType::Bytes
                     // budget and rate limiting is in effect.
-                    if !rate_limiter.consume(bytes.0, TokenType::Bytes) {
-                        // Revert the OPS consume().
-                        rate_limiter.manual_replenish(1, TokenType::Ops);
-                        // Stop processing the queue and return this descriptor chain to the
-                        // avail ring, for later processing.
-                        queue.go_to_previous_position();
-                        break;
+                    let rate_limit_reached = rate_limiter.consume(bytes.0, TokenType::Bytes);
+                    match rate_limit_reached {
+                        BucketReduction::Failure => {
+                            // Revert the OPS consume().
+                            rate_limiter.manual_replenish(1, TokenType::Ops);
+                            // Stop processing the queue and return this descriptor chain to the
+                            // avail ring, for later processing.
+                            queue.go_to_previous_position();
+                            limit_by_bytes = Wrapping(1);
+                            self.rate_limited.call_once(||{
+                                info!("{} block bw ratelimit fired", self.id)
+                            });
+                            break;
+                        }
+                        BucketReduction::OverConsumption(_r) => {
+                            limit_by_bytes = Wrapping(1);
+                            self.rate_limited.call_once(||{
+                                info!("{} block bw ratelimit fired", self.id)
+                            });
+                            break;
+                        }
+                        BucketReduction::Success => {}
                     }
                 };
             }
@@ -192,17 +222,51 @@ impl BlockEpollHandler {
                 queue
                     .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
                     .map_err(Error::QueueAddUsed)?;
-                used_descs = true;
+                queue
+                    .enable_notification(self.mem.memory().deref())
+                    .map_err(Error::QueueEnableNotification)?;
             }
         }
 
-        Ok(used_descs)
+        self.counters
+            .limit_by_bytes
+            .fetch_add(limit_by_bytes.0, Ordering::AcqRel);
+        self.counters
+            .limit_by_ops
+            .fetch_add(limit_by_ops.0, Ordering::AcqRel);
+        Ok(())
     }
 
-    fn process_queue_complete(&mut self) -> Result<bool> {
+    fn try_signal_used_queue(&mut self) -> result::Result<(), EpollHelperError> {
+        if self
+            .queue
+            .needs_notification(self.mem.memory().deref())
+            .map_err(|e| {
+                EpollHelperError::HandleEvent(anyhow!(
+                    "Failed to check needs_notification: {:?}",
+                    e
+                ))
+            })?
+        {
+            self.signal_used_queue().map_err(|e| {
+                EpollHelperError::HandleEvent(anyhow!("Failed to signal used queue: {:?}", e))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn process_queue_submit_and_signal(&mut self) -> result::Result<(), EpollHelperError> {
+        self.process_queue_submit().map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!("Failed to process queue (submit): {:?}", e))
+        })?;
+
+        self.try_signal_used_queue()
+    }
+
+    fn process_queue_complete(&mut self) -> Result<()> {
         let queue = &mut self.queue;
 
-        let mut used_descs = false;
         let mem = self.mem.memory();
         let mut read_bytes = Wrapping(0);
         let mut write_bytes = Wrapping(0);
@@ -254,7 +318,9 @@ impl BlockEpollHandler {
             queue
                 .add_used(mem.deref(), desc_index, len)
                 .map_err(Error::QueueAddUsed)?;
-            used_descs = true;
+            queue
+                .enable_notification(mem.deref())
+                .map_err(Error::QueueEnableNotification)?;
         }
 
         self.counters
@@ -271,7 +337,7 @@ impl BlockEpollHandler {
             .read_ops
             .fetch_add(read_ops.0, Ordering::AcqRel);
 
-        Ok(used_descs)
+        Ok(())
     }
 
     fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
@@ -318,21 +384,7 @@ impl EpollHelperHandler for BlockEpollHandler {
 
                 // Process the queue only when the rate limit is not reached
                 if !rate_limit_reached {
-                    let needs_notification = self.process_queue_submit().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!(
-                            "Failed to process queue (submit): {:?}",
-                            e
-                        ))
-                    })?;
-
-                    if needs_notification {
-                        self.signal_used_queue().map_err(|e| {
-                            EpollHelperError::HandleEvent(anyhow!(
-                                "Failed to signal used queue: {:?}",
-                                e
-                            ))
-                        })?
-                    };
+                    self.process_queue_submit_and_signal()?
                 }
             }
             COMPLETION_EVENT => {
@@ -340,21 +392,26 @@ impl EpollHelperHandler for BlockEpollHandler {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
                 })?;
 
-                let needs_notification = self.process_queue_complete().map_err(|e| {
+                self.process_queue_complete().map_err(|e| {
                     EpollHelperError::HandleEvent(anyhow!(
                         "Failed to process queue (complete): {:?}",
                         e
                     ))
                 })?;
 
-                if needs_notification {
-                    self.signal_used_queue().map_err(|e| {
+                let rate_limit_reached =
+                    self.rate_limiter.as_ref().map_or(false, |r| r.is_blocked());
+
+                // Process the queue only when the rate limit is not reached
+                if !rate_limit_reached {
+                    self.process_queue_submit().map_err(|e| {
                         EpollHelperError::HandleEvent(anyhow!(
-                            "Failed to signal used queue: {:?}",
+                            "Failed to process queue (submit): {:?}",
                             e
                         ))
                     })?;
                 }
+                self.try_signal_used_queue()?;
             }
             RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.rate_limiter {
@@ -367,21 +424,7 @@ impl EpollHelperHandler for BlockEpollHandler {
                         ))
                     })?;
 
-                    let needs_notification = self.process_queue_submit().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!(
-                            "Failed to process queue (submit): {:?}",
-                            e
-                        ))
-                    })?;
-
-                    if needs_notification {
-                        self.signal_used_queue().map_err(|e| {
-                            EpollHelperError::HandleEvent(anyhow!(
-                                "Failed to signal used queue: {:?}",
-                                e
-                            ))
-                        })?
-                    };
+                    self.process_queue_submit_and_signal()?
                 } else {
                     return Err(EpollHelperError::HandleEvent(anyhow!(
                         "Unexpected 'RATE_LIMITER_EVENT' when rate_limiter is not enabled."
@@ -415,7 +458,7 @@ pub struct Block {
     read_only: bool,
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 pub struct BlockState {
     pub disk_path: String,
     pub disk_nsectors: u64,
@@ -423,8 +466,6 @@ pub struct BlockState {
     pub acked_features: u64,
     pub config: VirtioBlockConfig,
 }
-
-impl VersionMapped for BlockState {}
 
 impl Block {
     /// Create a new virtio block device that operates on the given file.
@@ -443,7 +484,7 @@ impl Block {
         state: Option<BlockState>,
     ) -> io::Result<Self> {
         let (disk_nsectors, avail_features, acked_features, config) = if let Some(state) = state {
-            info!("Restoring virtio-block {}", id);
+            debug!("Restoring virtio-block {}", id);
             (
                 state.disk_nsectors,
                 state.avail_features,
@@ -469,7 +510,8 @@ impl Block {
                 | (1u64 << VIRTIO_BLK_F_FLUSH)
                 | (1u64 << VIRTIO_BLK_F_CONFIG_WCE)
                 | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
-                | (1u64 << VIRTIO_BLK_F_TOPOLOGY);
+                | (1u64 << VIRTIO_BLK_F_TOPOLOGY)
+                | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
             if iommu {
                 avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
@@ -635,8 +677,12 @@ impl VirtioDevice for Block {
         self.update_writeback();
 
         let mut epoll_threads = Vec::new();
+        let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
+
         for i in 0..queues.len() {
-            let (_, queue, queue_evt) = queues.remove(0);
+            let (_, mut queue, queue_evt) = queues.remove(0);
+            queue.set_event_idx(event_idx);
+
             let queue_size = queue.size();
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
@@ -669,6 +715,8 @@ impl VirtioDevice for Block {
                 rate_limiter,
                 access_platform: self.common.access_platform.clone(),
                 read_only: self.read_only,
+                rate_limited: std::sync::Once::new(),
+                id: self.id.clone(),
             };
 
             let paused = self.common.paused.clone();
@@ -715,6 +763,14 @@ impl VirtioDevice for Block {
             "write_ops",
             Wrapping(self.counters.write_ops.load(Ordering::Acquire)),
         );
+        counters.insert(
+            "limit_by_bytes",
+            Wrapping(self.counters.limit_by_bytes.load(Ordering::Acquire)),
+        );
+        counters.insert(
+            "limit_by_ops",
+            Wrapping(self.counters.limit_by_ops.load(Ordering::Acquire)),
+        );
 
         Some(counters)
     }
@@ -740,7 +796,7 @@ impl Snapshottable for Block {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id(), &self.state())
+        Snapshot::new_from_state(&self.id(), &self.state())
     }
 }
 impl Transportable for Block {}
