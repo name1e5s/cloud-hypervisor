@@ -11,20 +11,20 @@ mshv = ["mshv-ioctls", "mshv-bindings"]
 tdx = []
 
 [dependencies]
-anyhow = "1.0.66"
+anyhow = "1.0.86"
 byteorder = "1.4.3"
 thiserror = "1.0.37"
 libc = "0.2.137"
 log = "0.4.17"
-kvm-ioctls = { version = "0.11.0", optional = true }
-kvm-bindings = { git = "https://github.com/cloud-hypervisor/kvm-bindings", branch = "ch-v0.5.0-tdx", features = ["with-serde", "fam-wrappers"], optional  = true }
-mshv-bindings = { git = "https://github.com/rust-vmm/mshv", branch = "main", features = ["with-serde", "fam-wrappers"], optional  = true }
-mshv-ioctls = { git = "https://github.com/rust-vmm/mshv", branch = "main", optional  = true}
+kvm-bindings = { version = "0.8.1", features = ["serde"], optional = true }
+kvm-ioctls = { version = "0.17.0", optional = true }
+mshv-bindings = { git = "https://github.com/rust-vmm/mshv", tag = "v0.2.0", features = ["with-serde", "fam-wrappers"], optional = true }
+mshv-ioctls = { git = "https://github.com/rust-vmm/mshv", tag = "v0.2.0", optional = true }
 serde = { version = "1.0.147", features = ["rc", "derive"] }
 serde_with = { version = "2.0.1", default-features = false, features = ["macros"] }
-vfio-ioctls = { git = "https://github.com/rust-vmm/vfio", branch = "main", default-features = false }
-vm-memory = { version = "0.9.0", features = ["backend-mmap", "backend-atomic"] }
-vmm-sys-util = { version = "0.10.0", features = ["with-serde"] }
+vfio-ioctls = { git = "https://github.com/rust-vmm/vfio", rev = "64171f3", default-features = false }
+vm-memory = { version = "0.14.1", features = ["backend-mmap", "backend-atomic"] }
+vmm-sys-util = { version = "0.12.1", features = ["with-serde"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies.iced-x86]
 version = "1.17.0"
