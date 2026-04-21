@@ -18,6 +18,11 @@ pub mod gdt;
 #[allow(non_upper_case_globals)]
 pub mod msr_index;
 
+use serde::de::Error as SerdeError;
+use serde::{Deserialize, Deserializer, Serializer};
+
+
+
 // MTRR constants
 pub const MTRR_ENABLE: u64 = 0x800; // IA32_MTRR_DEF_TYPE MSR: E (MTRRs enabled) flag, bit 11
 pub const MTRR_MEM_TYPE_WB: u64 = 0x6;
@@ -226,6 +231,49 @@ pub struct SpecialRegisters {
     pub interrupt_bitmap: [u64; 4usize],
 }
 
+/// Serializes number to hex
+pub fn serialize_to_hex_str<S, N>(number: &N, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    N: std::fmt::LowerHex,
+{
+    serializer.serialize_str(format!("{:#x}", number).as_str())
+}
+
+macro_rules! deserialize_from_str {
+    ($name:ident, $type:tt) => {
+        /// Deserializes number from string.
+        /// Number can be in binary, hex or dec formats.
+        pub fn $name<'de, D>(deserializer: D) -> Result<$type, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let number_str = String::deserialize(deserializer)?;
+            let deserialized_number = if let Some(s) = number_str.strip_prefix("0b") {
+                $type::from_str_radix(s, 2)
+            } else if let Some(s) = number_str.strip_prefix("0x") {
+                $type::from_str_radix(s, 16)
+            } else {
+                return Err(D::Error::custom(format!(
+                    "No supported number system prefix found in value [{}]. Make sure to prefix \
+                     the number with '0x' for hexadecimal numbers or '0b' for binary numbers.",
+                    number_str,
+                )));
+            }
+            .map_err(|err| {
+                D::Error::custom(format!(
+                    "Failed to parse string [{}] as a number for CPU template - {:?}",
+                    number_str, err
+                ))
+            })?;
+            Ok(deserialized_number)
+        }
+    };
+}
+
+deserialize_from_str!(deserialize_from_str_u32, u32);
+deserialize_from_str!(deserialize_from_str_u64, u64);
+
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct CpuIdEntry {
     pub function: u32,
@@ -235,6 +283,38 @@ pub struct CpuIdEntry {
     pub ebx: u32,
     pub ecx: u32,
     pub edx: u32,
+}
+
+// To keep compatibility of old snaps, use a new structure.
+// Old snaps member are u32, and we use string here, in order
+// to get them from json file.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct CpuIdCustomEntry {
+    #[serde(
+        deserialize_with = "deserialize_from_str_u32",
+        serialize_with = "serialize_to_hex_str"
+    )]
+    pub function: u32,
+    pub index: u32,
+    pub flags: u32,
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+}
+
+impl From<CpuIdCustomEntry> for CpuIdEntry {
+    fn from(s: CpuIdCustomEntry) -> Self {
+        Self {
+            function: s.function,
+            index: s.index,
+            flags: s.flags,
+            eax: s.eax,
+            ebx: s.ebx,
+            ecx: s.ecx,
+            edx: s.edx,
+        }
+    }
 }
 
 pub const CPUID_FLAG_VALID_INDEX: u32 = 1;
@@ -308,4 +388,18 @@ impl LapicState {
 pub struct MsrEntry {
     pub index: u32,
     pub data: u64,
+}
+
+#[serde_with::serde_as]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct XsaveState {
+    #[serde_as(as = "[_; 1024usize]")]
+    pub region: [u32; 1024usize],
+}
+
+impl Default for XsaveState {
+    fn default() -> Self {
+        // SAFETY: this is plain old data structure
+        unsafe { ::std::mem::zeroed() }
+    }
 }
