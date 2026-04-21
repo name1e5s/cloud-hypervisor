@@ -3,11 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use crate::{MigratableError, VersionMapped};
+use crate::MigratableError;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use vm_memory::ByteValued;
 
 // Migration protocol
@@ -199,18 +197,16 @@ impl Response {
 }
 
 #[repr(C)]
-#[derive(Clone, Default, Serialize, Deserialize, Versionize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct MemoryRange {
     pub gpa: u64,
     pub length: u64,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize, Versionize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct MemoryRangeTable {
     data: Vec<MemoryRange>,
 }
-
-impl VersionMapped for MemoryRangeTable {}
 
 impl MemoryRangeTable {
     pub fn from_bitmap(bitmap: Vec<u64>, start_addr: u64, page_size: u64) -> Self {
@@ -274,10 +270,7 @@ impl MemoryRangeTable {
 
     pub fn write_to(&self, fd: &mut dyn Write) -> Result<(), MigratableError> {
         fd.write_all(unsafe {
-            std::slice::from_raw_parts(
-                self.data.as_ptr() as *const MemoryRange as *const u8,
-                self.length() as usize,
-            )
+            std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.length() as usize)
         })
         .map_err(MigratableError::MigrateSocket)
     }

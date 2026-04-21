@@ -343,6 +343,7 @@ impl RateLimiter {
         let timer_fd = TimerFd::new()?;
         // Note: vmm_sys_util::TimerFd::new() open the fd w/o O_NONBLOCK. We manually add this flag
         // so that `Self::event_handler` won't be blocked with `vmm_sys_util::TimerFd::wait()`.
+        // SAFETY: FFI calls.
         let ret = unsafe {
             let fd = timer_fd.as_raw_fd();
             let mut flags = libc::fcntl(fd, libc::F_GETFL);
@@ -370,13 +371,13 @@ impl RateLimiter {
         self.timer_active = true;
     }
 
-    /// Attempts to consume tokens and returns whether that is possible.
+    /// Attempts to consume tokens and returns the result.
     ///
     /// If rate limiting is disabled on provided `token_type`, this function will always succeed.
-    pub fn consume(&mut self, tokens: u64, token_type: TokenType) -> bool {
+    pub fn consume(&mut self, tokens: u64, token_type: TokenType) -> BucketReduction {
         // If the timer is active, we can't consume tokens from any bucket and the function fails.
         if self.timer_active {
-            return false;
+            return BucketReduction::Failure;
         }
 
         // Identify the required token bucket.
@@ -395,10 +396,10 @@ impl RateLimiter {
                     if !self.timer_active {
                         self.activate_timer(TIMER_REFILL_DUR);
                     }
-                    false
+                    BucketReduction::Failure
                 }
                 // The operation succeeded and further calls can be made.
-                BucketReduction::Success => true,
+                BucketReduction::Success => BucketReduction::Success,
                 // The operation succeeded as the tokens have been consumed
                 // but the timer still needs to be armed.
                 BucketReduction::OverConsumption(ratio) => {
@@ -409,13 +410,13 @@ impl RateLimiter {
                     // further calls to the rate limiter for
                     // `ratio * refill_time` milliseconds.
                     self.activate_timer(Duration::from_millis((ratio * refill_time as f64) as u64));
-                    true
+                    BucketReduction::OverConsumption(ratio)
                 }
             }
         } else {
             // If bucket is not present rate limiting is disabled on token type,
             // consume() will always succeed.
-            true
+            BucketReduction::Success
         }
     }
 
@@ -644,8 +645,14 @@ pub(crate) mod tests {
         // limiter should not be blocked
         assert!(!l.is_blocked());
         // limiter should be disabled so consume(whatever) should work
-        assert!(l.consume(u64::max_value(), TokenType::Ops));
-        assert!(l.consume(u64::max_value(), TokenType::Bytes));
+        assert_eq!(
+            l.consume(u64::max_value(), TokenType::Ops),
+            BucketReduction::Success
+        );
+        assert_eq!(
+            l.consume(u64::max_value(), TokenType::Bytes),
+            BucketReduction::Success
+        );
         // calling the handler without there having been an event should error
         assert!(l.event_handler().is_err());
         assert_eq!(
@@ -678,14 +685,14 @@ pub(crate) mod tests {
         let mut l = RateLimiter::new(1000, 0, 1000, 1000, 0, 1000).unwrap();
 
         // consume 123 bytes
-        assert!(l.consume(123, TokenType::Bytes));
+        assert_eq!(l.consume(123, TokenType::Bytes), BucketReduction::Success);
         l.manual_replenish(23, TokenType::Bytes);
         {
             let bytes_tb = l.get_token_bucket(TokenType::Bytes).unwrap();
             assert_eq!(bytes_tb.budget(), 900);
         }
         // consume 123 ops
-        assert!(l.consume(123, TokenType::Ops));
+        assert_eq!(l.consume(123, TokenType::Ops), BucketReduction::Success);
         l.manual_replenish(23, TokenType::Ops);
         {
             let bytes_tb = l.get_token_bucket(TokenType::Ops).unwrap();
@@ -704,12 +711,15 @@ pub(crate) mod tests {
         assert!(l.as_raw_fd() > 0);
 
         // ops/s limiter should be disabled so consume(whatever) should work
-        assert!(l.consume(u64::max_value(), TokenType::Ops));
+        assert_eq!(
+            l.consume(u64::max_value(), TokenType::Ops),
+            BucketReduction::Success
+        );
 
         // do full 1000 bytes
-        assert!(l.consume(1000, TokenType::Bytes));
+        assert_eq!(l.consume(1000, TokenType::Bytes), BucketReduction::Success);
         // try and fail on another 100
-        assert!(!l.consume(100, TokenType::Bytes));
+        assert_eq!(l.consume(100, TokenType::Bytes), BucketReduction::Failure);
         // since consume failed, limiter should be blocked now
         assert!(l.is_blocked());
         // wait half the timer period
@@ -723,7 +733,7 @@ pub(crate) mod tests {
         // limiter should now be unblocked
         assert!(!l.is_blocked());
         // try and succeed on another 100 bytes this time
-        assert!(l.consume(100, TokenType::Bytes));
+        assert_eq!(l.consume(100, TokenType::Bytes), BucketReduction::Success);
     }
 
     #[test]
@@ -737,12 +747,15 @@ pub(crate) mod tests {
         assert!(l.as_raw_fd() > 0);
 
         // bytes/s limiter should be disabled so consume(whatever) should work
-        assert!(l.consume(u64::max_value(), TokenType::Bytes));
+        assert_eq!(
+            l.consume(u64::max_value(), TokenType::Bytes),
+            BucketReduction::Success
+        );
 
         // do full 1000 ops
-        assert!(l.consume(1000, TokenType::Ops));
+        assert_eq!(l.consume(1000, TokenType::Ops), BucketReduction::Success);
         // try and fail on another 100
-        assert!(!l.consume(100, TokenType::Ops));
+        assert_eq!(l.consume(100, TokenType::Ops), BucketReduction::Failure);
         // since consume failed, limiter should be blocked now
         assert!(l.is_blocked());
         // wait half the timer period
@@ -756,7 +769,7 @@ pub(crate) mod tests {
         // limiter should now be unblocked
         assert!(!l.is_blocked());
         // try and succeed on another 100 ops this time
-        assert!(l.consume(100, TokenType::Ops));
+        assert_eq!(l.consume(100, TokenType::Ops), BucketReduction::Success);
     }
 
     #[test]
@@ -770,13 +783,13 @@ pub(crate) mod tests {
         assert!(l.as_raw_fd() > 0);
 
         // do full 1000 bytes
-        assert!(l.consume(1000, TokenType::Ops));
+        assert_eq!(l.consume(1000, TokenType::Ops), BucketReduction::Success);
         // do full 1000 bytes
-        assert!(l.consume(1000, TokenType::Bytes));
+        assert_eq!(l.consume(1000, TokenType::Bytes), BucketReduction::Success);
         // try and fail on another 100 ops
-        assert!(!l.consume(100, TokenType::Ops));
+        assert_eq!(l.consume(100, TokenType::Ops), BucketReduction::Failure);
         // try and fail on another 100 bytes
-        assert!(!l.consume(100, TokenType::Bytes));
+        assert_eq!(l.consume(100, TokenType::Bytes), BucketReduction::Failure);
         // since consume failed, limiter should be blocked now
         assert!(l.is_blocked());
         // wait half the timer period
@@ -790,9 +803,9 @@ pub(crate) mod tests {
         // limiter should now be unblocked
         assert!(!l.is_blocked());
         // try and succeed on another 100 ops this time
-        assert!(l.consume(100, TokenType::Ops));
+        assert_eq!(l.consume(100, TokenType::Ops), BucketReduction::Success);
         // try and succeed on another 100 bytes this time
-        assert!(l.consume(100, TokenType::Bytes));
+        assert_eq!(l.consume(100, TokenType::Bytes), BucketReduction::Success);
     }
 
     #[test]
@@ -802,7 +815,10 @@ pub(crate) mod tests {
         // try to consume 2.5x the bucket size
         // we are "borrowing" 1.5x the bucket size in tokens since
         // the bucket is full
-        assert!(l.consume(2500, TokenType::Bytes));
+        assert_eq!(
+            l.consume(2500, TokenType::Bytes),
+            BucketReduction::OverConsumption(1.5_f64)
+        );
 
         // check that even after a whole second passes, the rate limiter
         // is still blocked
@@ -822,7 +838,10 @@ pub(crate) mod tests {
         // we are "borrowing" 1.5x the bucket size in tokens since
         // the bucket is full, should arm the timer to 0.5x replenish
         // time, which is 500 ms
-        assert!(l.consume(1500, TokenType::Bytes));
+        assert_eq!(
+            l.consume(1500, TokenType::Bytes),
+            BucketReduction::OverConsumption(0.5_f64)
+        );
 
         // check that after more than the minimum refill time,
         // the rate limiter is still blocked
@@ -832,7 +851,7 @@ pub(crate) mod tests {
 
         // try to consume some tokens, which should fail as the timer
         // is still active
-        assert!(!l.consume(100, TokenType::Bytes));
+        assert_eq!(l.consume(100, TokenType::Bytes), BucketReduction::Failure);
         assert!(l.event_handler().is_err());
         assert!(l.is_blocked());
 
@@ -842,14 +861,14 @@ pub(crate) mod tests {
         thread::sleep(Duration::from_millis(100));
         assert!(l.event_handler().is_err());
         assert!(l.is_blocked());
-        assert!(!l.consume(100, TokenType::Bytes));
+        assert_eq!(l.consume(100, TokenType::Bytes), BucketReduction::Failure);
 
         // after waiting out the full duration, rate limiter should be
         // availale again
         thread::sleep(Duration::from_millis(200));
         assert!(l.event_handler().is_ok());
         assert!(!l.is_blocked());
-        assert!(l.consume(100, TokenType::Bytes));
+        assert_eq!(l.consume(100, TokenType::Bytes), BucketReduction::Success);
     }
 
     #[test]
@@ -888,7 +907,7 @@ pub(crate) mod tests {
     fn test_rate_limiter_debug() {
         let l = RateLimiter::new(1, 2, 3, 4, 5, 6).unwrap();
         assert_eq!(
-            format!("{:?}", l),
+            format!("{l:?}"),
             format!(
                 "RateLimiter {{ bandwidth: {:?}, ops: {:?} }}",
                 l.bandwidth(),

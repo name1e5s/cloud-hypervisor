@@ -6,16 +6,15 @@
 use crate::{PciCapability, PciCapabilityId};
 use anyhow::anyhow;
 use byteorder::{ByteOrder, LittleEndian};
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::result;
 use std::sync::Arc;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use vm_device::interrupt::{
     InterruptIndex, InterruptSourceConfig, InterruptSourceGroup, MsiIrqSourceConfig,
 };
 use vm_memory::ByteValued;
-use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable, VersionMapped};
+use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
 
 const MAX_MSIX_VECTORS_PER_DEVICE: u16 = 2048;
 const MSIX_TABLE_ENTRIES_MODULO: u64 = 16;
@@ -28,14 +27,14 @@ const MSIX_ENABLE_MASK: u16 = (1 << MSIX_ENABLE_BIT) as u16;
 pub const MSIX_TABLE_ENTRY_SIZE: usize = 16;
 
 #[derive(Debug)]
-enum Error {
+pub enum Error {
     /// Failed enabling the interrupt route.
     EnableInterruptRoute(io::Error),
     /// Failed updating the interrupt route.
     UpdateInterruptRoute(io::Error),
 }
 
-#[derive(Debug, Clone, Versionize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MsixTableEntry {
     pub msg_addr_lo: u32,
     pub msg_addr_hi: u32,
@@ -60,15 +59,13 @@ impl Default for MsixTableEntry {
     }
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 struct MsixConfigState {
     table_entries: Vec<MsixTableEntry>,
     pba_entries: Vec<u64>,
     masked: bool,
     enabled: bool,
 }
-
-impl VersionMapped for MsixConfigState {}
 
 pub struct MsixConfig {
     pub table_entries: Vec<MsixTableEntry>,
@@ -430,11 +427,11 @@ impl Snapshottable for MsixConfig {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id(), &self.state())
+        Snapshot::new_from_state(&self.id(), &self.state())
     }
 
     fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
-        self.set_state(&snapshot.to_versioned_state(&self.id())?)
+        self.set_state(&snapshot.to_state(&self.id())?)
             .map_err(|e| {
                 MigratableError::Restore(anyhow!(
                     "Could not restore state for {}: {:?}",
@@ -447,7 +444,7 @@ impl Snapshottable for MsixConfig {
 
 #[allow(dead_code)]
 #[repr(packed)]
-#[derive(Clone, Copy, Default, Versionize)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct MsixCap {
     // Message Control Register
     //   10-0:  MSI-X Table size
