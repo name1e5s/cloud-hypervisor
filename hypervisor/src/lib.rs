@@ -65,6 +65,7 @@ pub use vm::{
 pub enum HypervisorType {
     Kvm,
     Mshv,
+    KvmPvm,
 }
 
 pub fn new() -> std::result::Result<Arc<dyn Hypervisor>, HypervisorError> {

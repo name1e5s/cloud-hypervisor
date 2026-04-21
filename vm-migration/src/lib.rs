@@ -7,20 +7,8 @@ use crate::protocol::MemoryRangeTable;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use versionize::{VersionMap, Versionize};
 
 pub mod protocol;
-
-/// Global VMM version for versioning
-const MAJOR_VERSION: u16 = 28;
-const MINOR_VERSION: u16 = 0;
-const VMM_VERSION: u16 = MAJOR_VERSION << 12 | MINOR_VERSION & 0b1111;
-
-pub trait VersionMapped {
-    fn version_map() -> VersionMap {
-        VersionMap::new()
-    }
-}
 
 #[derive(Error, Debug)]
 pub enum MigratableError {
@@ -85,7 +73,7 @@ pub struct SnapshotDataSection {
     pub id: String,
 
     /// The section serialized snapshot.
-    pub snapshot: Vec<u8>,
+    pub snapshot: String,
 }
 
 impl SnapshotDataSection {
@@ -94,22 +82,9 @@ impl SnapshotDataSection {
     where
         T: Deserialize<'a>,
     {
-        serde_json::from_slice(&self.snapshot).map_err(|e| {
+        serde_json::from_str(&self.snapshot).map_err(|e| {
             MigratableError::Restore(anyhow!("Error deserialising: {} {}", self.id, e))
         })
-    }
-
-    /// Generate versioned state
-    pub fn to_versioned_state<T>(&self) -> Result<T, MigratableError>
-    where
-        T: Versionize + VersionMapped,
-    {
-        T::deserialize(
-            &mut self.snapshot.as_slice(),
-            &T::version_map(),
-            VMM_VERSION,
-        )
-        .map_err(|e| MigratableError::Restore(anyhow!("Error deserialising: {} {}", self.id, e)))
     }
 
     /// Create from state that can be serialized
@@ -117,25 +92,7 @@ impl SnapshotDataSection {
     where
         T: Serialize,
     {
-        let snapshot = serde_json::to_vec(state)
-            .map_err(|e| MigratableError::Snapshot(anyhow!("Error serialising: {} {}", id, e)))?;
-
-        let snapshot_data = SnapshotDataSection {
-            id: format!("{}-section", id),
-            snapshot,
-        };
-
-        Ok(snapshot_data)
-    }
-
-    /// Create from versioned state
-    pub fn new_from_versioned_state<T>(id: &str, state: &T) -> Result<Self, MigratableError>
-    where
-        T: Versionize + VersionMapped,
-    {
-        let mut snapshot = Vec::new();
-        state
-            .serialize(&mut snapshot, &T::version_map(), VMM_VERSION)
+        let snapshot = serde_json::to_string(state)
             .map_err(|e| MigratableError::Snapshot(anyhow!("Error serialising: {} {}", id, e)))?;
 
         let snapshot_data = SnapshotDataSection {
@@ -191,17 +148,6 @@ impl Snapshot {
         Ok(snapshot_data)
     }
 
-    /// Create from versioned state
-    pub fn new_from_versioned_state<T>(id: &str, state: &T) -> Result<Self, MigratableError>
-    where
-        T: Versionize + VersionMapped,
-    {
-        let mut snapshot_data = Snapshot::new(id);
-        snapshot_data.add_data_section(SnapshotDataSection::new_from_versioned_state(id, state)?);
-
-        Ok(snapshot_data)
-    }
-
     /// Add a sub-component's Snapshot to the Snapshot.
     pub fn add_snapshot(&mut self, snapshot: Snapshot) {
         self.snapshots
@@ -223,34 +169,21 @@ impl Snapshot {
             .ok_or_else(|| MigratableError::Restore(anyhow!("Missing section for {}", id)))?
             .to_state()
     }
-
-    /// Generate versioned state
-    pub fn to_versioned_state<T>(&self, id: &str) -> Result<T, MigratableError>
-    where
-        T: Versionize + VersionMapped,
-    {
-        self.snapshot_data
-            .get(&format!("{}-section", id))
-            .ok_or_else(|| MigratableError::Restore(anyhow!("Missing section for {}", id)))?
-            .to_versioned_state()
-    }
 }
 
 pub fn snapshot_from_id(snapshot: Option<&Snapshot>, id: &str) -> Option<Snapshot> {
     snapshot.and_then(|s| s.snapshots.get(id).map(|s| *s.clone()))
 }
 
-pub fn versioned_state_from_id<T>(
-    snapshot: Option<&Snapshot>,
-    id: &str,
-) -> Result<Option<T>, MigratableError>
+pub fn state_from_id<'a, T>(s: Option<&'a Snapshot>, id: &str) -> Result<Option<T>, MigratableError>
 where
-    T: Versionize + VersionMapped,
+    T: Deserialize<'a>,
 {
-    snapshot
-        .and_then(|s| s.snapshots.get(id).map(|s| *s.clone()))
-        .map(|s| s.to_versioned_state(id))
-        .transpose()
+    if let Some(s) = s.as_ref() {
+        s.snapshots.get(id).map(|s| s.to_state(id)).transpose()
+    } else {
+        Ok(None)
+    }
 }
 
 /// A snapshottable component can be snapshotted.

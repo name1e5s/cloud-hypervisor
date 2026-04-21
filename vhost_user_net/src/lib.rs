@@ -25,13 +25,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::vec::Vec;
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::Listener;
+use vhost_user_backend::bitmap::BitmapMmapRegion;
 use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
 use virtio_bindings::bindings::virtio_net::*;
 use vm_memory::GuestAddressSpace;
-use vm_memory::{bitmap::AtomicBitmap, GuestMemoryAtomic};
+use vm_memory::GuestMemoryAtomic;
 use vmm_sys_util::{epoll::EventSet, eventfd::EventFd};
 
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<BitmapMmapRegion>;
 
 pub type Result<T> = std::result::Result<T, Error>;
 type VhostUserBackendResult<T> = std::result::Result<T, std::io::Error>;
@@ -159,9 +160,9 @@ impl VhostUserNetBackend {
     }
 }
 
-impl VhostUserBackendMut<VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>, AtomicBitmap>
-    for VhostUserNetBackend
-{
+impl VhostUserBackendMut for VhostUserNetBackend {
+    type Bitmap = BitmapMmapRegion;
+    type Vring = VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>;
     fn num_queues(&self) -> usize {
         self.num_queues
     }
@@ -204,7 +205,7 @@ impl VhostUserBackendMut<VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>, Atomic
         _evset: EventSet,
         vrings: &[VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>],
         thread_id: usize,
-    ) -> VhostUserBackendResult<bool> {
+    ) -> VhostUserBackendResult<()> {
         let mut thread = self.threads[thread_id].lock().unwrap();
         match device_event {
             0 => {
@@ -246,7 +247,7 @@ impl VhostUserBackendMut<VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>, Atomic
             _ => return Err(Error::HandleEventUnknownEvent.into()),
         }
 
-        Ok(false)
+        Ok(())
     }
 
     fn exit_event(&self, thread_index: usize) -> Option<EventFd> {
