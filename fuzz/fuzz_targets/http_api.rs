@@ -180,6 +180,9 @@ fn http_receiver_stub(exit_evt: EventFd, api_evt: EventFd, api_receiver: Receive
                         ApiRequest::VmPowerButton(sender) => {
                             sender.send(Ok(ApiResponsePayload::Empty)).unwrap();
                         }
+                        ApiRequest::VmWaitStart(sender) => {
+                            sender.send(Ok(ApiResponsePayload::Empty)).unwrap();
+                        }
                     }
                 }
             }
