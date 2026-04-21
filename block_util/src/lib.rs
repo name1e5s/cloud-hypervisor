@@ -22,6 +22,7 @@ pub mod vhdx_sync;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
 use io_uring::{opcode, IoUring, Probe};
+use serde::{Deserialize, Serialize};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cmp;
 use std::convert::TryInto;
@@ -33,18 +34,14 @@ use std::result;
 use std::sync::Arc;
 use std::sync::MutexGuard;
 use thiserror::Error;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use virtio_bindings::bindings::virtio_blk::*;
 use virtio_queue::DescriptorChain;
 use vm_memory::{
-    bitmap::AtomicBitmap, bitmap::Bitmap, ByteValued, Bytes, GuestAddress, GuestMemory,
-    GuestMemoryError, GuestMemoryLoadGuard,
+    bitmap::Bitmap, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError,
+    GuestMemoryLoadGuard,
 };
 use vm_virtio::{AccessPlatform, Translatable};
 use vmm_sys_util::eventfd::EventFd;
-
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 
 const SECTOR_SHIFT: u8 = 9;
 pub const SECTOR_SIZE: u64 = 0x01 << SECTOR_SHIFT;
@@ -111,10 +108,14 @@ pub enum ExecuteError {
     Flush(io::Error),
     #[error("Failed to read: {0}")]
     Read(GuestMemoryError),
+    #[error("Failed to read_exact: {0}")]
+    ReadExact(io::Error),
     #[error("Failed to seek: {0}")]
     Seek(io::Error),
     #[error("Failed to write: {0}")]
     Write(GuestMemoryError),
+    #[error("Failed to write_all: {0}")]
+    WriteAll(io::Error),
     #[error("Unsupported request: {0}")]
     Unsupported(u32),
     #[error("Failed to submit io uring: {0}")]
@@ -137,8 +138,10 @@ impl ExecuteError {
             ExecuteError::BadRequest(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::Flush(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::Read(_) => VIRTIO_BLK_S_IOERR,
+            ExecuteError::ReadExact(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::Seek(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::Write(_) => VIRTIO_BLK_S_IOERR,
+            ExecuteError::WriteAll(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::Unsupported(_) => VIRTIO_BLK_S_UNSUPP,
             ExecuteError::SubmitIoUring(_) => VIRTIO_BLK_S_IOERR,
             ExecuteError::GetHostAddress(_) => VIRTIO_BLK_S_IOERR,
@@ -159,8 +162,8 @@ pub enum RequestType {
     Unsupported(u32),
 }
 
-pub fn request_type(
-    mem: &GuestMemoryMmap,
+pub fn request_type<B: Bitmap + 'static>(
+    mem: &vm_memory::GuestMemoryMmap<B>,
     desc_addr: GuestAddress,
 ) -> result::Result<RequestType, Error> {
     let type_ = mem.read_obj(desc_addr).map_err(Error::GuestMemory)?;
@@ -173,7 +176,10 @@ pub fn request_type(
     }
 }
 
-fn sector(mem: &GuestMemoryMmap, desc_addr: GuestAddress) -> result::Result<u64, Error> {
+fn sector<B: Bitmap + 'static>(
+    mem: &vm_memory::GuestMemoryMmap<B>,
+    desc_addr: GuestAddress,
+) -> result::Result<u64, Error> {
     const SECTOR_OFFSET: usize = 8;
     let addr = match mem.checked_offset(desc_addr, SECTOR_OFFSET) {
         Some(v) => v,
@@ -202,8 +208,8 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn parse(
-        desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap>>,
+    pub fn parse<B: Bitmap + 'static>(
+        desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<vm_memory::GuestMemoryMmap<B>>>,
         access_platform: Option<&Arc<dyn AccessPlatform>>,
     ) -> result::Result<Request, Error> {
         let hdr_desc = desc_chain
@@ -292,11 +298,11 @@ impl Request {
         Ok(req)
     }
 
-    pub fn execute<T: Seek + Read + Write>(
+    pub fn execute<T: Seek + Read + Write, B: Bitmap + 'static>(
         &self,
         disk: &mut T,
         disk_nsectors: u64,
-        mem: &GuestMemoryMmap,
+        mem: &vm_memory::GuestMemoryMmap<B>,
         disk_id: &[u8],
     ) -> result::Result<u32, ExecuteError> {
         disk.seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
@@ -316,13 +322,21 @@ impl Request {
 
             match self.request_type {
                 RequestType::In => {
-                    mem.read_exact_from(*data_addr, disk, *data_len as usize)
-                        .map_err(ExecuteError::Read)?;
+                    let mut buf = vec![0u8; *data_len as usize];
+                    disk.read_exact(&mut buf).map_err(ExecuteError::ReadExact)?;
+                    mem.read_exact_volatile_from(
+                        *data_addr,
+                        &mut buf.as_slice(),
+                        *data_len as usize,
+                    )
+                    .map_err(ExecuteError::Read)?;
                     len += data_len;
                 }
                 RequestType::Out => {
-                    mem.write_all_to(*data_addr, disk, *data_len as usize)
+                    let mut buf: Vec<u8> = Vec::new();
+                    mem.write_volatile_to(*data_addr, &mut buf, *data_len as usize)
                         .map_err(ExecuteError::Write)?;
+                    disk.write_all(&buf).map_err(ExecuteError::WriteAll)?;
                     if !self.writeback {
                         disk.flush().map_err(ExecuteError::Flush)?;
                     }
@@ -341,9 +355,9 @@ impl Request {
         Ok(len)
     }
 
-    pub fn execute_async(
+    pub fn execute_async<B: Bitmap + 'static>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &vm_memory::GuestMemoryMmap<B>,
         disk_nsectors: u64,
         disk_image: &mut dyn AsyncIo,
         disk_id: &[u8],
@@ -372,13 +386,13 @@ impl Request {
             let origin_ptr = mem
                 .get_slice(*data_addr, *data_len as usize)
                 .map_err(ExecuteError::GetHostAddress)?
-                .as_ptr();
+                .ptr_guard();
 
             // Verify the buffer alignment.
             // In case it's not properly aligned, an intermediate buffer is
             // created with the correct alignment, and a copy from/to the
             // origin buffer is performed, depending on the type of operation.
-            let iov_base = if (origin_ptr as u64) % SECTOR_SIZE != 0 {
+            let iov_base = if (origin_ptr.as_ptr() as u64) % SECTOR_SIZE != 0 {
                 let layout =
                     Layout::from_size_align(*data_len as usize, SECTOR_SIZE as usize).unwrap();
                 // Safe because layout has non-zero size
@@ -394,15 +408,13 @@ impl Request {
                 if request_type == RequestType::Out {
                     // Safe because destination buffer has been allocated with
                     // the proper size.
-                    unsafe {
-                        std::ptr::copy(origin_ptr as *const u8, aligned_ptr, *data_len as usize)
-                    };
+                    unsafe { std::ptr::copy(origin_ptr.as_ptr(), aligned_ptr, *data_len as usize) };
                 }
 
                 // Store both origin and aligned pointers for complete_async()
                 // to process them.
                 self.aligned_operations.push(AlignedOperation {
-                    origin_ptr: origin_ptr as u64,
+                    origin_ptr: origin_ptr.as_ptr() as u64,
                     aligned_ptr: aligned_ptr as u64,
                     size: *data_len as usize,
                     layout,
@@ -410,7 +422,7 @@ impl Request {
 
                 aligned_ptr as *mut libc::c_void
             } else {
-                origin_ptr as *mut libc::c_void
+                origin_ptr.as_ptr() as *mut libc::c_void
             };
 
             let iovec = libc::iovec {
@@ -497,7 +509,7 @@ impl Request {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Versionize)]
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
 #[repr(C, packed)]
 pub struct VirtioBlockConfig {
     pub capacity: u64,
@@ -520,7 +532,7 @@ pub struct VirtioBlockConfig {
     pub write_zeroes_may_unmap: u8,
     pub unused1: [u8; 3],
 }
-#[derive(Copy, Clone, Debug, Default, Versionize)]
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
 #[repr(C, packed)]
 pub struct VirtioBlockGeometry {
     pub cylinders: u16,
