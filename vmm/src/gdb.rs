@@ -32,7 +32,8 @@ use gdbstub_arch::aarch64::AArch64 as GdbArch;
 use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 #[cfg(target_arch = "x86_64")]
 use gdbstub_arch::x86::X86_64_SSE as GdbArch;
-use std::{os::unix::net::UnixListener, sync::mpsc};
+use std::os::unix::net::UnixListener;
+use std::sync::mpsc::{channel, RecvError, RecvTimeoutError, Sender};
 use vm_memory::{GuestAddress, GuestMemoryError};
 
 type ArchUsize = u64;
@@ -85,14 +86,14 @@ pub enum Error {
     Vm(crate::vm::Error),
     GdbRequest,
     GdbResponseNotify(std::io::Error),
-    GdbResponse(mpsc::RecvError),
-    GdbResponseTimeout(mpsc::RecvTimeoutError),
+    GdbResponse(RecvError),
+    GdbResponseTimeout(RecvTimeoutError),
 }
 type GdbResult<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub struct GdbRequest {
-    pub sender: mpsc::Sender<GdbResponse>,
+    pub sender: Sender<GdbResponse>,
     pub payload: GdbRequestPayload,
     pub cpu_id: usize,
 }
@@ -121,7 +122,7 @@ pub enum GdbResponsePayload {
 }
 
 pub struct GdbStub {
-    gdb_sender: mpsc::Sender<GdbRequest>,
+    gdb_sender: Sender<GdbRequest>,
     gdb_event: vmm_sys_util::eventfd::EventFd,
     vm_event: vmm_sys_util::eventfd::EventFd,
     hw_breakpoints: Vec<GuestAddress>,
@@ -130,7 +131,7 @@ pub struct GdbStub {
 
 impl GdbStub {
     pub fn new(
-        gdb_sender: mpsc::Sender<GdbRequest>,
+        gdb_sender: Sender<GdbRequest>,
         gdb_event: vmm_sys_util::eventfd::EventFd,
         vm_event: vmm_sys_util::eventfd::EventFd,
         hw_breakpoints: usize,
@@ -149,7 +150,7 @@ impl GdbStub {
         payload: GdbRequestPayload,
         cpu_id: usize,
     ) -> GdbResult<GdbResponsePayload> {
-        let (response_sender, response_receiver) = std::sync::mpsc::channel();
+        let (response_sender, response_receiver) = channel();
         let request = GdbRequest {
             sender: response_sender,
             payload,

@@ -4,12 +4,19 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::RwLock;
+
 use hypervisor::HypervisorType;
+use lazy_static::lazy_static;
 use seccompiler::{
     BackendError, BpfProgram, Error, SeccompAction, SeccompCmpArgLen as ArgLen, SeccompCmpOp::Eq,
     SeccompCondition as Cond, SeccompFilter, SeccompRule,
 };
 use std::convert::TryInto;
+
+lazy_static! {
+    static ref RUTIME_RULES: RwLock<Vec<(i64, Vec<SeccompRule>)>> = RwLock::new(Vec::new());
+}
 
 pub enum Thread {
     Api,
@@ -17,6 +24,7 @@ pub enum Thread {
     Vcpu,
     Vmm,
     PtyForeground,
+    All,
 }
 
 /// Shorthand for chaining `SeccompCondition`s with the `and` operator  in a `SeccompRule`.
@@ -238,7 +246,7 @@ fn create_vmm_ioctl_seccomp_rule_hypervisor(
 ) -> Result<Vec<SeccompRule>, BackendError> {
     match hypervisor_type {
         #[cfg(feature = "kvm")]
-        HypervisorType::Kvm => create_vmm_ioctl_seccomp_rule_common_kvm(),
+        HypervisorType::Kvm | HypervisorType::KvmPvm => create_vmm_ioctl_seccomp_rule_common_kvm(),
         #[cfg(feature = "mshv")]
         HypervisorType::Mshv => create_vmm_ioctl_seccomp_rule_common_mshv(),
         #[allow(unreachable_patterns)]
@@ -415,7 +423,7 @@ fn create_vmm_ioctl_seccomp_rule(
 ) -> Result<Vec<SeccompRule>, BackendError> {
     match hypervisor_type {
         #[cfg(feature = "kvm")]
-        HypervisorType::Kvm => create_vmm_ioctl_seccomp_rule_kvm(),
+        HypervisorType::Kvm | HypervisorType::KvmPvm => create_vmm_ioctl_seccomp_rule_kvm(),
         #[cfg(feature = "mshv")]
         HypervisorType::Mshv => create_vmm_ioctl_seccomp_rule_mshv(),
         #[allow(unreachable_patterns)]
@@ -533,6 +541,7 @@ fn vmm_thread_rules(
             libc::SYS_ioctl,
             create_vmm_ioctl_seccomp_rule(hypervisor_type)?,
         ),
+        (libc::SYS_getcwd, vec![]),
         (libc::SYS_io_uring_enter, vec![]),
         (libc::SYS_io_uring_setup, vec![]),
         (libc::SYS_io_uring_register, vec![]),
@@ -607,13 +616,77 @@ fn vmm_thread_rules(
             libc::SYS_umask,
             or![and![Cond::new(0, ArgLen::Dword, Eq, 0o077)?]],
         ),
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "s390x",
+            target_arch = "powerpc64le"
+        ))]
         (libc::SYS_unlink, vec![]),
-        #[cfg(target_arch = "aarch64")]
         (libc::SYS_unlinkat, vec![]),
         (libc::SYS_wait4, vec![]),
         (libc::SYS_write, vec![]),
         (libc::SYS_writev, vec![]),
+        // native virtiofs stuff
+        (libc::SYS_capget, vec![]), // For CAP_FSETID
+        (libc::SYS_capset, vec![]),
+        (libc::SYS_copy_file_range, vec![]),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "s390x",
+            target_arch = "powerpc64le"
+        ))]
+        (libc::SYS_epoll_create, vec![]),
+        (libc::SYS_fchdir, vec![]),
+        (libc::SYS_fchmod, vec![]),
+        (libc::SYS_fchmodat, vec![]),
+        (libc::SYS_fchownat, vec![]),
+        (libc::SYS_fgetxattr, vec![]),
+        (libc::SYS_flistxattr, vec![]),
+        (libc::SYS_flock, vec![]),
+        (libc::SYS_fremovexattr, vec![]),
+        (libc::SYS_fsetxattr, vec![]),
+        #[cfg(target_arch = "s390x")]
+        (libc::SYS_fstatfs64, vec![]),
+        (libc::SYS_fstatfs, vec![]),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "s390x",
+            target_arch = "powerpc64le"
+        ))]
+        (libc::SYS_getdents, vec![]),
+        (libc::SYS_getdents64, vec![]),
+        (libc::SYS_getegid, vec![]),
+        (libc::SYS_geteuid, vec![]),
+        (libc::SYS_getxattr, vec![]),
+        (libc::SYS_linkat, vec![]),
+        (libc::SYS_listxattr, vec![]),
+        (libc::SYS_mkdirat, vec![]),
+        (libc::SYS_mknodat, vec![]),
+        (libc::SYS_name_to_handle_at, vec![]),
+        (libc::SYS_openat2, vec![]),
+        (libc::SYS_open_by_handle_at, vec![]),
+        (libc::SYS_pwritev2, vec![]),
+        (libc::SYS_renameat, vec![]),
+        (libc::SYS_renameat2, vec![]),
+        (libc::SYS_removexattr, vec![]),
+        (libc::SYS_setresgid, vec![]),
+        (libc::SYS_setresuid, vec![]),
+        //(libc::SYS_setresgid32);  Needed on some platforms,
+        //(libc::SYS_setresuid32);  Needed on some platforms
+        (libc::SYS_setxattr, vec![]),
+        #[cfg(target_arch = "s390x")]
+        (libc::SYS_sigreturn, vec![]),
+        (libc::SYS_symlinkat, vec![]),
+        (libc::SYS_syncfs, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_time, vec![]), // Rarely needed, except on static builds
+        (libc::SYS_unshare, vec![]),
+        (libc::SYS_utimensat, vec![]),
+        // to support operations in init_backendfs()
+        (libc::SYS_lstat, vec![]),
+        // Async log.
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_setsockopt, vec![]),
     ])
 }
 
@@ -650,7 +723,7 @@ fn create_vcpu_ioctl_seccomp_rule_hypervisor(
 ) -> Result<Vec<SeccompRule>, BackendError> {
     match hypervisor_type {
         #[cfg(feature = "kvm")]
-        HypervisorType::Kvm => create_vcpu_ioctl_seccomp_rule_kvm(),
+        HypervisorType::Kvm | HypervisorType::KvmPvm => create_vcpu_ioctl_seccomp_rule_kvm(),
         #[cfg(feature = "mshv")]
         HypervisorType::Mshv => create_vcpu_ioctl_seccomp_rule_mshv(),
         #[allow(unreachable_patterns)]
@@ -763,6 +836,50 @@ fn api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
     ])
 }
 
+fn thread_rules(
+    hypervisor_type: HypervisorType,
+) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    let mut rules = api_thread_rules()?;
+    rules.append(&mut signal_handler_thread_rules()?);
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut vcpu_thread_rules(hypervisor_type).unwrap());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut vmm_thread_rules(hypervisor_type).unwrap());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut pty_foreground_thread_rules().unwrap());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut virtio_devices::seccomp_filters::virtio_device_thread_rules());
+    rules.append(&mut create_runtime_seccomp_rules()?);
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+
+    let mut ioctl_rule = vec![];
+    let rule = create_signal_handler_ioctl_seccomp_rule()?;
+    ioctl_rule.extend(rule);
+    let rule = create_pty_foreground_ioctl_seccomp_rule()?;
+    ioctl_rule.extend(rule);
+    let rule = create_vmm_ioctl_seccomp_rule(hypervisor_type)?;
+    ioctl_rule.extend(rule);
+    let rule = create_vcpu_ioctl_seccomp_rule(hypervisor_type)?;
+    ioctl_rule.extend(rule);
+    let rule = create_api_ioctl_seccomp_rule()?;
+    ioctl_rule.extend(rule);
+    let rule = virtio_devices::seccomp_filters::create_virtio_device_ioctl_seccomp_rule();
+    ioctl_rule.extend(rule);
+
+    let mut ioctl_rules = vec![(libc::SYS_ioctl, ioctl_rule)];
+    rules.append(&mut ioctl_rules);
+
+    Ok(rules)
+}
+
+fn create_runtime_seccomp_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(RUTIME_RULES.read().unwrap().to_vec())
+}
+
+pub fn set_runtime_seccomp_rules(rules: Vec<(i64, Vec<SeccompRule>)>) {
+    *RUTIME_RULES.write().unwrap() = rules;
+}
+
 fn get_seccomp_rules(
     thread_type: Thread,
     hypervisor_type: HypervisorType,
@@ -773,6 +890,7 @@ fn get_seccomp_rules(
         Thread::Vcpu => Ok(vcpu_thread_rules(hypervisor_type)?),
         Thread::Vmm => Ok(vmm_thread_rules(hypervisor_type)?),
         Thread::PtyForeground => Ok(pty_foreground_thread_rules()?),
+        Thread::All => Ok(thread_rules(hypervisor_type)?),
     }
 }
 
@@ -795,16 +913,33 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
-        _ => SeccompFilter::new(
-            get_seccomp_rules(thread_type, hypervisor_type)
-                .map_err(Error::Backend)?
-                .into_iter()
-                .collect(),
-            SeccompAction::Trap,
-            SeccompAction::Allow,
-            std::env::consts::ARCH.try_into().unwrap(),
-        )
-        .and_then(|filter| filter.try_into())
-        .map_err(Error::Backend),
+        SeccompAction::KillProcess => match thread_type {
+            Thread::All => SeccompFilter::new(
+                get_seccomp_rules(thread_type, hypervisor_type)
+                    .map_err(Error::Backend)?
+                    .into_iter()
+                    .collect(),
+                SeccompAction::Trap,
+                SeccompAction::Allow,
+                std::env::consts::ARCH.try_into().unwrap(),
+            )
+            .and_then(|filter| filter.try_into())
+            .map_err(Error::Backend),
+            _ => Ok(vec![]),
+        },
+        _ => match thread_type {
+            Thread::All => Ok(vec![]),
+            _ => SeccompFilter::new(
+                get_seccomp_rules(thread_type, hypervisor_type)
+                    .map_err(Error::Backend)?
+                    .into_iter()
+                    .collect(),
+                SeccompAction::Trap,
+                SeccompAction::Allow,
+                std::env::consts::ARCH.try_into().unwrap(),
+            )
+            .and_then(|filter| filter.try_into())
+            .map_err(Error::Backend),
+        },
     }
 }
