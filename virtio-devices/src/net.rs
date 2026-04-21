@@ -538,6 +538,7 @@ impl Net {
         rate_limiter_config: Option<RateLimiterConfig>,
         exit_evt: EventFd,
         state: Option<NetState>,
+        #[allow(unused_variables)] sandbox_id: Option<String>,
     ) -> Result<Self> {
         let taps = open_tap(
             if_name,
@@ -547,6 +548,7 @@ impl Net {
             mtu,
             num_queues / 2,
             None,
+            sandbox_id,
         )
         .map_err(Error::OpenTap)?;
 
@@ -731,11 +733,13 @@ impl VirtioDevice for Net {
                 .map_err(ActivateError::CreateRateLimiter)?;
 
             let tap = taps.remove(0);
-            tap.set_offload(virtio_features_to_tap_offload(self.common.acked_features))
-                .map_err(|e| {
-                    error!("Error programming tap offload: {:?}", e);
-                    ActivateError::BadActivate
-                })?;
+            if !tap.is_donated() {
+                tap.set_offload(virtio_features_to_tap_offload(self.common.acked_features))
+                    .map_err(|e| {
+                        error!("Error programming tap offload: {:?}", e);
+                        ActivateError::BadActivate
+                    })?;
+            }
 
             let mut handler = NetEpollHandler {
                 net: NetQueuePair {
