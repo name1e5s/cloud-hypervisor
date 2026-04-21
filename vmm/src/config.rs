@@ -3,7 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-pub use crate::vm_config::*;
+pub use virtio_devices::fs::{
+    default_fsconfig_cache, default_fsconfig_read_only, default_fsconfig_rlimit_nofile,
+    default_fsconfig_thread_pool_size, default_fsconfig_xattr, BackendFsConfig,
+    BACKEND_FS_CACHE_ALWAYS, BACKEND_FS_CACHE_AUTO, BACKEND_FS_CACHE_NEVER, BACKEND_FS_CACHE_NONE,
+};
+pub use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
+
 use clap::ArgMatches;
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple,
@@ -11,14 +17,21 @@ use option_parser::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::convert::From;
-use std::fmt;
+use std::convert::TryFrom;
 use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
+use std::{fmt, fs};
 use thiserror::Error;
-use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
+use virtiofsd::passthrough::xattrmap::XattrMap;
+
+use crate::vm_config::*;
 
 const MAX_NUM_PCI_SEGMENTS: u16 = 16;
+
+const UPDATE_FS_SHARED_DIR_FIELD: &str = "shared_dir";
+const UPDATE_FS_ALLOWED_DIRS_FIELD: &str = "allowed_dirs";
+const UPDATE_FS_CACHE_FIELD: &str = "cache";
 
 /// Errors associated with VM configuration parameters.
 #[derive(Debug, Error)]
@@ -35,10 +48,18 @@ pub enum Error {
     ParseVsockCidMissing,
     /// Missing restore source_url parameter.
     ParseRestoreSourceUrlMissing,
+    /// Missing restore device id parameter.
+    ParseRestoreDeviceIdMissing,
+    /// Missing restore device path parameter.
+    ParseRestoreDevicePathMissing,
     /// Error parsing CPU options
     ParseCpus(OptionParserError),
     /// Invalid CPU features
     InvalidCpuFeatures(String),
+    /// Invalid Ivshmem backend file size
+    InvalidIvshmemSize(u64),
+    /// Invalid Ivshmem backend file path
+    InvalidIvshmemPath(std::io::Error),
     /// Error parsing memory options
     ParseMemory(OptionParserError),
     /// Error parsing memory zone options
@@ -69,6 +90,8 @@ pub enum Error {
     ParseVsock(OptionParserError),
     /// Failed parsing restore parameters
     ParseRestore(OptionParserError),
+    /// Failed parsing restore device parameters
+    ParseRestoreDevice(OptionParserError),
     /// Failed parsing SGX EPC parameters
     #[cfg(target_arch = "x86_64")]
     ParseSgxEpc(OptionParserError),
@@ -97,14 +120,18 @@ pub enum Error {
     ParseVdpaPathMissing,
     /// Failed parsing TPM device
     ParseTpm(OptionParserError),
+    /// Failed parsing ivsmem device
+    ParseIvshmem(OptionParserError),
     /// Missing path for TPM device
     ParseTpmPathMissing,
+    /// Filesystem shared_dir is missing
+    ParseFsSharedDirMissing,
+    /// Missing path for ivsmem device
+    ParseIvshmemPathMissing,
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum ValidationError {
-    /// Both console and serial are tty.
-    DoubleTtyMode,
     /// No kernel specified
     KernelMissing,
     /// Missing file value for console
@@ -170,6 +197,8 @@ pub enum ValidationError {
     DuplicateDevicePath(String),
     /// Provided MTU is lower than what the VIRTIO specification expects
     InvalidMtu(u16),
+    /// native virtio-fs shouldn't have socket argument
+    NativeVirtioFsSocket,
 }
 
 type ValidationResult<T> = std::result::Result<T, ValidationError>;
@@ -178,7 +207,6 @@ impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::ValidationError::*;
         match self {
-            DoubleTtyMode => write!(f, "Console mode tty specified for both serial and console"),
             KernelMissing => write!(f, "No kernel specified"),
             ConsoleFileMissing => write!(f, "Path missing when using file console mode"),
             CpusMaxLowerThanBoot => write!(f, "Max CPUs lower than boot CPUs"),
@@ -276,6 +304,9 @@ impl fmt::Display for ValidationError {
                 write!(f, "Device does not support being placed behind IOMMU")
             }
             DuplicateDevicePath(p) => write!(f, "Duplicated device path: {}", p),
+            NativeVirtioFsSocket => {
+                write!(f, "Native virtio-fs shouldn't have socket argument")
+            }
             &InvalidMtu(mtu) => {
                 write!(
                     f,
@@ -297,6 +328,8 @@ impl fmt::Display for Error {
             }
             ParseCpus(o) => write!(f, "Error parsing --cpus: {}", o),
             InvalidCpuFeatures(o) => write!(f, "Invalid feature in --cpus features list: {}", o),
+            InvalidIvshmemSize(o) => write!(f, "Invalid ivshmem backend file size: {}", o),
+            InvalidIvshmemPath(o) => write!(f, "Invalid ivshmem backend file path: {}", o),
             ParseDevice(o) => write!(f, "Error parsing --device: {}", o),
             ParseDevicePathMissing => write!(f, "Error parsing --device: path missing"),
             ParseFileSystem(o) => write!(f, "Error parsing --fs: {}", o),
@@ -315,6 +348,7 @@ impl fmt::Display for Error {
             ParseRng(o) => write!(f, "Error parsing --rng: {}", o),
             ParseBalloon(o) => write!(f, "Error parsing --balloon: {}", o),
             ParseRestore(o) => write!(f, "Error parsing --restore: {}", o),
+            ParseRestoreDevice(o) => write!(f, "Error parsing --restore-device: {}", o),
             #[cfg(target_arch = "x86_64")]
             ParseSgxEpc(o) => write!(f, "Error parsing --sgx-epc: {}", o),
             #[cfg(target_arch = "x86_64")]
@@ -322,6 +356,12 @@ impl fmt::Display for Error {
             ParseNuma(o) => write!(f, "Error parsing --numa: {}", o),
             ParseRestoreSourceUrlMissing => {
                 write!(f, "Error parsing --restore: source_url missing")
+            }
+            ParseRestoreDeviceIdMissing => {
+                write!(f, "Error parsing --restore-device: id missing")
+            }
+            ParseRestoreDevicePathMissing => {
+                write!(f, "Error parsing --restore-device: path missing")
             }
             ParseUserDeviceSocketMissing => {
                 write!(f, "Error parsing --user-device: socket missing")
@@ -336,7 +376,10 @@ impl fmt::Display for Error {
             ParseVdpa(o) => write!(f, "Error parsing --vdpa: {}", o),
             ParseVdpaPathMissing => write!(f, "Error parsing --vdpa: path missing"),
             ParseTpm(o) => write!(f, "Error parsing --tpm: {}", o),
+            ParseIvshmem(o) => write!(f, "Error parsing --ivshmem: {}", o),
             ParseTpmPathMissing => write!(f, "Error parsing --tpm: path missing"),
+            ParseFsSharedDirMissing => write!(f, "Error parsing --shared_dir: path missing"),
+            ParseIvshmemPathMissing => write!(f, "Error parsing --ivshmem: path missing"),
         }
     }
 }
@@ -371,6 +414,7 @@ pub struct VmParams<'a> {
     pub user_devices: Option<Vec<&'a str>>,
     pub vdpa: Option<Vec<&'a str>>,
     pub vsock: Option<&'a str>,
+    pub pvpanic: bool,
     #[cfg(target_arch = "x86_64")]
     pub sgx_epc: Option<Vec<&'a str>>,
     pub numa: Option<Vec<&'a str>>,
@@ -379,6 +423,8 @@ pub struct VmParams<'a> {
     pub gdb: bool,
     pub platform: Option<&'a str>,
     pub tpm: Option<&'a str>,
+    pub sys_ctrl: bool,
+    pub ivshmem: Option<&'a str>,
 }
 
 impl<'a> VmParams<'a> {
@@ -431,6 +477,9 @@ impl<'a> VmParams<'a> {
         #[cfg(feature = "guest_debug")]
         let gdb = args.contains_id("gdb");
         let tpm: Option<&str> = args.get_one::<String>("tpm").map(|x| x as &str);
+        let sys_ctrl = args.get_flag("sys-ctrl");
+        let ivshmem: Option<&str> = args.get_one::<String>("ivshmem").map(|x| x as &str);
+        let pvpanic = args.get_flag("pvpanic");
         VmParams {
             cpus,
             memory,
@@ -451,6 +500,7 @@ impl<'a> VmParams<'a> {
             user_devices,
             vdpa,
             vsock,
+            pvpanic,
             #[cfg(target_arch = "x86_64")]
             sgx_epc,
             numa,
@@ -459,6 +509,8 @@ impl<'a> VmParams<'a> {
             gdb,
             platform,
             tpm,
+            sys_ctrl,
+            ivshmem,
         }
     }
 }
@@ -513,6 +565,24 @@ impl FromStr for CpuTopology {
     }
 }
 
+#[derive(Debug)]
+pub enum ParseCompatibleModeError {
+    InvalidValue(String),
+}
+
+impl FromStr for CompatibleMode {
+    type Err = ParseCompatibleModeError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "vendor" => Ok(CompatibleMode::Vendor),
+            "max" => Ok(CompatibleMode::Max),
+            "ignore" => Ok(CompatibleMode::Ignore),
+            _ => Err(ParseCompatibleModeError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
 impl CpusConfig {
     pub fn parse(cpus: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -523,7 +593,8 @@ impl CpusConfig {
             .add("kvm_hyperv")
             .add("max_phys_bits")
             .add("affinity")
-            .add("features");
+            .add("features")
+            .add("compatible");
         parser.parse(cpus).map_err(Error::ParseCpus)?;
 
         let boot_vcpus: u8 = parser
@@ -559,6 +630,11 @@ impl CpusConfig {
             .convert::<StringList>("features")
             .map_err(Error::ParseCpus)?
             .unwrap_or_default();
+        let compatible = parser
+            .convert("compatible")
+            .map_err(Error::ParseCpus)?
+            .unwrap_or_default();
+
         // Some ugliness here as the features being checked might be disabled
         // at compile time causing the below allow and the need to specify the
         // ref type in the match.
@@ -585,6 +661,7 @@ impl CpusConfig {
             max_phys_bits,
             affinity,
             features,
+            compatible,
         })
     }
 }
@@ -668,7 +745,8 @@ impl MemoryConfig {
             .add("hugepages")
             .add("hugepage_size")
             .add("prefault")
-            .add("thp");
+            .add("thp")
+            .add("dirty_log");
         parser.parse(memory).map_err(Error::ParseMemory)?;
 
         let size = parser
@@ -716,6 +794,11 @@ impl MemoryConfig {
             .convert::<Toggle>("thp")
             .map_err(Error::ParseMemory)?
             .unwrap_or(Toggle(true))
+            .0;
+        let dirty_log = parser
+            .convert::<Toggle>("dirty_log")
+            .map_err(Error::ParseMemory)?
+            .unwrap_or(Toggle(false))
             .0;
 
         let zones: Option<Vec<MemoryZoneConfig>> = if let Some(memory_zones) = &memory_zones {
@@ -804,6 +887,7 @@ impl MemoryConfig {
             prefault,
             zones,
             thp,
+            dirty_log,
         })
     }
 
@@ -823,6 +907,28 @@ impl MemoryConfig {
         }
 
         size
+    }
+
+    pub fn exist_shared(&self) -> bool {
+        if self.shared {
+            return true;
+        }
+
+        if let Some(zones) = &self.zones {
+            for zone in zones.iter() {
+                if zone.shared {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub fn has_hotplug_virtio_mem(&self) -> bool {
+        self.hotplug_method == HotplugMethod::VirtioMem
+            && self.hotplugged_size.is_some()
+            && self.hotplugged_size.unwrap() > 0
     }
 }
 
@@ -1269,21 +1375,181 @@ impl BalloonConfig {
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
     \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>\"";
+    queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>,\
+    native=<use_native_virtiofs>,shared_dir=<shared_dir>,xattr=<xattr>,\
+    posix_acl=<posix_acl>,xattrmap=<xattrmap>,announce_submounts=<announce_submounts>\
+    cache=<cache>,no_readdirplus=<no_readdirplus>,writeback=<writeback>,\
+    allow_direct_io=<allow_direct_io>,read_only=<read_only>,rlimit_nofile=<rlimit_nofile>,\
+    killpriv_v2=<killpriv_v2>,security_label=<security_label>,\
+    thread_pool_size=<thread_pool_size>,ops_size=<ops_size>,\
+    ops_one_time_burst=<ops_one_time_burst>,ops_refill_time=<ops_refill_time>,\
+    bw_size=<bw_size>,bw_one_time_burst=<bw_one_time_burst>,bw_refill_time=<bw_refill_time>,\
+    allowed_dirs=<dir_list>\"";
 
-    pub fn parse(fs: &str) -> Result<Self> {
-        let mut parser = OptionParser::new();
+    fn add_frontend_args(parser: &mut OptionParser) {
         parser
             .add("tag")
             .add("queue_size")
             .add("num_queues")
             .add("socket")
             .add("id")
-            .add("pci_segment");
+            .add("pci_segment")
+            .add("native");
+    }
+
+    fn add_backend_args(parser: &mut OptionParser) {
+        parser
+            .add("shared_dir")
+            .add("thread_pool_size")
+            .add("xattr")
+            .add("posix_acl")
+            .add("xattrmap")
+            .add("announce_submounts")
+            .add("cache")
+            .add("no_readdirplus")
+            .add("writeback")
+            .add("allow_direct_io")
+            .add("read_only")
+            .add("rlimit_nofile")
+            .add("killpriv_v2")
+            .add("security_label")
+            .add("allowed_dirs");
+    }
+
+    fn add_ratelimiter_args(parser: &mut OptionParser) {
+        parser
+            .add("ops_size")
+            .add("ops_one_time_burst")
+            .add("ops_refill_time")
+            .add("bw_size")
+            .add("bw_one_time_burst")
+            .add("bw_refill_time");
+    }
+
+    fn parse_backendfs(parser: &OptionParser) -> Result<BackendFsConfig> {
+        let shared_dir = parser
+            .get("shared_dir")
+            .ok_or(Error::ParseFsSharedDirMissing)?;
+        let thread_pool_size = parser
+            .convert("thread_pool_size")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(default_fsconfig_thread_pool_size);
+        let xattr = parser
+            .convert("xattr")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(default_fsconfig_xattr);
+        let posix_acl = parser
+            .convert::<Toggle>("posix_acl")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let xattrmap = parser.get("xattrmap");
+        if let Some(ref map_str) = xattrmap {
+            XattrMap::try_from(map_str.as_str()).map_err(|_| {
+                Error::ParseFileSystem(OptionParserError::Conversion(
+                    "xattrmap".to_string(),
+                    map_str.to_string(),
+                ))
+            })?;
+        }
+        let announce_submounts = parser
+            .convert::<Toggle>("announce_submounts")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let no_readdirplus = parser
+            .convert::<Toggle>("no_readdirplus")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let writeback = parser
+            .convert::<Toggle>("writeback")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let allow_direct_io = parser
+            .convert::<Toggle>("allow_direct_io")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let read_only = parser
+            .convert("read_only")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(default_fsconfig_read_only);
+        let killpriv_v2 = parser
+            .convert::<Toggle>("killpriv_v2")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let security_label = parser
+            .convert::<Toggle>("security_label")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let cache;
+        if let Some(cache_string) = parser.get("cache") {
+            cache = match cache_string.as_str() {
+                "auto" => BACKEND_FS_CACHE_AUTO,
+                "always" => BACKEND_FS_CACHE_ALWAYS,
+                "never" => BACKEND_FS_CACHE_NEVER,
+                "none" => BACKEND_FS_CACHE_NONE,
+                cache_str => {
+                    return Err(Error::ParseFileSystem(OptionParserError::Conversion(
+                        "cache".to_string(),
+                        cache_str.to_string(),
+                    )))
+                }
+            }
+        } else {
+            cache = default_fsconfig_cache();
+        }
+        let rlimit_nofile = parser
+            .convert("rlimit_nofile")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_else(default_fsconfig_rlimit_nofile);
+        let allowed_dirs = parser
+            .convert::<StringList>("allowed_dirs")
+            .map_err(Error::ParseFileSystem)?
+            .map(|v| v.0);
+
+        Ok(BackendFsConfig {
+            shared_dir,
+            thread_pool_size,
+            xattr,
+            posix_acl,
+            xattrmap,
+            announce_submounts,
+            cache,
+            no_readdirplus,
+            writeback,
+            read_only,
+            allow_direct_io,
+            rlimit_nofile,
+            killpriv_v2,
+            security_label,
+            allowed_dirs,
+        })
+    }
+
+    pub fn parse(fs: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        Self::add_frontend_args(&mut parser);
+        Self::add_backend_args(&mut parser);
+        Self::add_ratelimiter_args(&mut parser);
+
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
+        let native = parser
+            .convert::<Toggle>("native")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+
         let tag = parser.get("tag").ok_or(Error::ParseFsTagMissing)?;
-        let socket = PathBuf::from(parser.get("socket").ok_or(Error::ParseFsSockMissing)?);
+        let mut socket = PathBuf::new();
+        if !native {
+            socket = PathBuf::from(parser.get("socket").ok_or(Error::ParseFsSockMissing)?);
+        }
 
         let queue_size = parser
             .convert("queue_size")
@@ -1301,6 +1567,67 @@ impl FsConfig {
             .map_err(Error::ParseFileSystem)?
             .unwrap_or_default();
 
+        let mut backendfs_config = None;
+        // backend args are ignored if native is false
+        let rate_limiter_config = if native {
+            backendfs_config = Some(Self::parse_backendfs(&parser)?);
+
+            let ops_size = parser
+                .convert("ops_size")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let ops_one_time_burst = parser
+                .convert("ops_one_time_burst")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let ops_refill_time = parser
+                .convert("ops_refill_time")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
+                Some(TokenBucketConfig {
+                    size: ops_size,
+                    one_time_burst: Some(ops_one_time_burst),
+                    refill_time: ops_refill_time,
+                })
+            } else {
+                None
+            };
+
+            let bw_size = parser
+                .convert("bw_size")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let bw_one_time_burst = parser
+                .convert("bw_one_time_burst")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let bw_refill_time = parser
+                .convert("bw_refill_time")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
+                Some(TokenBucketConfig {
+                    size: bw_size,
+                    one_time_burst: Some(bw_one_time_burst),
+                    refill_time: bw_refill_time,
+                })
+            } else {
+                None
+            };
+
+            if ops_tb_config.is_some() || bw_tb_config.is_some() {
+                Some(RateLimiterConfig {
+                    bandwidth: bw_tb_config,
+                    ops: ops_tb_config,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(FsConfig {
             tag,
             socket,
@@ -1308,10 +1635,25 @@ impl FsConfig {
             queue_size,
             id,
             pci_segment,
+            backendfs_config,
+            rate_limiter_config,
         })
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        if self.backendfs_config.is_some() {
+            if self.socket.to_str() != Some("") {
+                return Err(ValidationError::NativeVirtioFsSocket);
+            }
+        } else {
+            if self.socket.to_str() == Some("") {
+                return Err(ValidationError::VhostUserMissingSocket);
+            }
+            if !vm_config.backed_by_shared_memory() {
+                return Err(ValidationError::VhostUserRequiresSharedMemory);
+            }
+        }
+
         if self.num_queues > vm_config.cpus.boot_vcpus as usize {
             return Err(ValidationError::TooManyQueues);
         }
@@ -1406,6 +1748,7 @@ impl ConsoleConfig {
             .add_valueless("tty")
             .add_valueless("null")
             .add("file")
+            .add("sigwinch")
             .add("iommu");
         parser.parse(console).map_err(Error::ParseConsole)?;
 
@@ -1433,8 +1776,18 @@ impl ConsoleConfig {
             .map_err(Error::ParseConsole)?
             .unwrap_or(Toggle(false))
             .0;
+        let sigwinch = parser
+            .convert::<Toggle>("sigwinch")
+            .map_err(Error::ParseConsole)?
+            .unwrap_or(Toggle(false))
+            .0;
 
-        Ok(Self { file, mode, iommu })
+        Ok(Self {
+            file,
+            mode,
+            iommu,
+            sigwinch,
+        })
     }
 }
 
@@ -1591,7 +1944,7 @@ impl VdpaConfig {
 
 impl VsockConfig {
     pub const SYNTAX: &'static str = "Virtio VSOCK parameters \
-        \"cid=<context_id>,socket=<socket_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>\"";
+        \"cid=<context_id>,socket=<socket_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>,muxer_epoll_nested=on|off\"";
     pub fn parse(vsock: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -1599,7 +1952,8 @@ impl VsockConfig {
             .add("cid")
             .add("iommu")
             .add("id")
-            .add("pci_segment");
+            .add("pci_segment")
+            .add("muxer_epoll_nested");
         parser.parse(vsock).map_err(Error::ParseVsock)?;
 
         let socket = parser
@@ -1620,6 +1974,11 @@ impl VsockConfig {
             .convert("pci_segment")
             .map_err(Error::ParseVsock)?
             .unwrap_or_default();
+        let muxer_epoll_nested = parser
+            .convert::<Toggle>("muxer_epoll_nested")
+            .map_err(Error::ParseVsock)?
+            .unwrap_or(Toggle(false))
+            .0;
 
         Ok(VsockConfig {
             cid,
@@ -1627,6 +1986,7 @@ impl VsockConfig {
             iommu,
             id,
             pci_segment,
+            muxer_epoll_nested,
         })
     }
 
@@ -1726,11 +2086,24 @@ impl NumaConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RestoreDevice {
+    pub id: String,
+    pub path: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct RestoreConfig {
     pub source_url: PathBuf,
     #[serde(default)]
     pub prefault: bool,
+    pub disks: Option<Vec<DiskConfig>>,
+    pub net: Option<Vec<NetConfig>>,
+    pub fs: Option<Vec<FsConfig>>,
+    pub vsock: Option<VsockConfig>,
+    pub pmem: Option<Vec<PmemConfig>>,
+    #[serde(default)]
+    pub dirty_log: bool,
 }
 
 impl RestoreConfig {
@@ -1752,10 +2125,21 @@ impl RestoreConfig {
             .map_err(Error::ParseRestore)?
             .unwrap_or(Toggle(false))
             .0;
+        let dirty_log = parser
+            .convert::<Toggle>("dirty_log")
+            .map_err(Error::ParseRestore)?
+            .unwrap_or(Toggle(false))
+            .0;
 
         Ok(RestoreConfig {
             source_url,
             prefault,
+            disks: None,
+            net: None,
+            fs: None,
+            vsock: None,
+            pmem: None,
+            dirty_log,
         })
     }
 }
@@ -1773,6 +2157,46 @@ impl TpmConfig {
             .ok_or(Error::ParseTpmPathMissing)?;
         Ok(TpmConfig { socket })
     }
+}
+
+impl IvshmemConfig {
+    pub const SYNTAX: &'static str = "Ivshmem device \
+        \"(backend file) path=</path/to/a/file>,size=<file_size/must=2^n>\"";
+    pub fn parse(ivshmem: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        parser.add("path").add("size");
+        parser.parse(ivshmem).map_err(Error::ParseIvshmem)?;
+        let path = parser
+            .get("path")
+            .map(PathBuf::from)
+            .ok_or(Error::ParseIvshmemPathMissing)?;
+
+        let size = parser
+            .convert::<ByteSized>("size")
+            .map_err(Error::ParseIvshmem)?
+            .unwrap_or(ByteSized((DEFAULT_IVSHMEM_SIZE << 20) as u64))
+            .0;
+
+        // size must = 2^n
+        if size == 0 || (size & (size - 1)) != 0 {
+            return Err(Error::InvalidIvshmemSize(size));
+        }
+        let metadata = fs::metadata(path.to_str().unwrap()).map_err(Error::InvalidIvshmemPath)?;
+        if metadata.len() < size {
+            return Err(Error::InvalidIvshmemSize(size));
+        }
+
+        Ok(IvshmemConfig {
+            path,
+            size: size as usize,
+        })
+    }
+}
+
+enum DeviceValue {
+    Str(String),
+    Arr(Vec<String>),
+    Value(u64),
 }
 
 impl VmConfig {
@@ -1810,6 +2234,173 @@ impl VmConfig {
         }
     }
 
+    pub fn update_disks(&mut self, disk_cfgs: &Vec<DiskConfig>) {
+        if let Some(disks) = &mut self.disks {
+            let mut devices: HashMap<String, PathBuf> = HashMap::default();
+            let mut rate_limiter: HashMap<String, RateLimiterConfig> = HashMap::default();
+            for disk_cfg in disk_cfgs.iter() {
+                if disk_cfg.id.is_none() {
+                    continue;
+                }
+                if disk_cfg.path.is_some() {
+                    devices.insert(
+                        disk_cfg.id.as_ref().unwrap().clone(),
+                        disk_cfg.path.as_ref().unwrap().clone(),
+                    );
+                }
+                if disk_cfg.rate_limiter_config.is_some() {
+                    rate_limiter.insert(
+                        disk_cfg.id.as_ref().unwrap().clone(),
+                        disk_cfg.rate_limiter_config.as_ref().unwrap().clone(),
+                    );
+                }
+            }
+
+            for disk in disks.iter_mut() {
+                if let Some(id) = &disk.id {
+                    if let Some(path) = devices.get(&id.clone()) {
+                        disk.path = Some(PathBuf::from(path));
+                    }
+                    if let Some(rate_limit) = rate_limiter.get(&id.clone()) {
+                        disk.rate_limiter_config = Some(*rate_limit);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn update_nets(&mut self, net_cfgs: &Vec<NetConfig>) {
+        if let Some(nets) = &mut self.net {
+            let mut devices: HashMap<String, String> = HashMap::default();
+            let mut rate_limiter: HashMap<String, RateLimiterConfig> = HashMap::default();
+            for net_cfg in net_cfgs.iter() {
+                if net_cfg.id.is_none() {
+                    continue;
+                }
+                if net_cfg.tap.is_some() {
+                    devices.insert(
+                        net_cfg.id.as_ref().unwrap().clone(),
+                        net_cfg.tap.as_ref().unwrap().clone(),
+                    );
+                }
+                if net_cfg.rate_limiter_config.is_some() {
+                    rate_limiter.insert(
+                        net_cfg.id.as_ref().unwrap().clone(),
+                        net_cfg.rate_limiter_config.as_ref().unwrap().clone(),
+                    );
+                }
+            }
+
+            for net in nets.iter_mut() {
+                if let Some(id) = &net.id {
+                    if let Some(tap) = devices.get(&id.clone()) {
+                        net.tap = Some(tap.clone());
+                    }
+                    if let Some(rate_limit) = rate_limiter.get(&id.clone()) {
+                        net.rate_limiter_config = Some(*rate_limit);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn update_fses(&mut self, fs_cfgs: &Vec<FsConfig>) {
+        if let Some(fses) = &mut self.fs {
+            let mut devices = HashMap::new();
+            let mut rate_limiter: HashMap<String, RateLimiterConfig> = HashMap::default();
+
+            for fs_cfg in fs_cfgs.iter() {
+                if fs_cfg.id.is_none() {
+                    continue;
+                }
+                if let Some(backend) = &fs_cfg.backendfs_config {
+                    let mut device = HashMap::new();
+
+                    device.insert(
+                        UPDATE_FS_SHARED_DIR_FIELD,
+                        DeviceValue::Str(backend.shared_dir.clone()),
+                    );
+                    if backend.allowed_dirs.is_some() {
+                        device.insert(
+                            UPDATE_FS_ALLOWED_DIRS_FIELD,
+                            DeviceValue::Arr(backend.allowed_dirs.clone().unwrap().clone()),
+                        );
+                    }
+                    device.insert(
+                        UPDATE_FS_CACHE_FIELD,
+                        DeviceValue::Value(backend.cache as u64),
+                    );
+                    devices.insert(fs_cfg.id.as_ref().unwrap().clone(), device);
+                }
+                if fs_cfg.rate_limiter_config.is_some() {
+                    rate_limiter.insert(
+                        fs_cfg.id.as_ref().unwrap().clone(),
+                        fs_cfg.rate_limiter_config.as_ref().unwrap().clone(),
+                    );
+                }
+            }
+
+            for fs in fses.iter_mut() {
+                if let Some(id) = &fs.id {
+                    if let Some(backend) = &mut fs.backendfs_config {
+                        if let Some(device) = devices.get(id) {
+                            if let Some(DeviceValue::Str(shared_dir)) =
+                                device.get(UPDATE_FS_SHARED_DIR_FIELD)
+                            {
+                                backend.shared_dir = shared_dir.clone();
+                            }
+                            if let Some(DeviceValue::Arr(allowed_dirs)) =
+                                device.get(UPDATE_FS_ALLOWED_DIRS_FIELD)
+                            {
+                                backend.allowed_dirs = Some(allowed_dirs.clone());
+                            }
+                            if let Some(DeviceValue::Value(cache)) =
+                                device.get(UPDATE_FS_CACHE_FIELD)
+                            {
+                                backend.cache = *cache as u8;
+                            }
+                        }
+                    }
+                    if let Some(rate_limit) = rate_limiter.get(id) {
+                        fs.rate_limiter_config = Some(*rate_limit);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn update_vsock(&mut self, vsock_cfg: &VsockConfig) {
+        if let Some(vsock) = &mut self.vsock {
+            if vsock.id.is_none() {
+                return;
+            }
+            if vsock_cfg.id.is_none() {
+                return;
+            }
+            vsock.socket = vsock_cfg.socket.clone();
+        }
+    }
+
+    pub fn update_pmem(&mut self, pmem_cfgs: &[PmemConfig]) {
+        if let Some(pmems) = &mut self.pmem {
+            let mut new_cfgs: HashMap<String, PathBuf> = HashMap::default();
+
+            for cfg in pmem_cfgs.iter() {
+                if let Some(id) = &cfg.id {
+                    new_cfgs.insert(id.to_string(), cfg.file.clone());
+                }
+            }
+
+            for pmem in pmems.iter_mut() {
+                if let Some(id) = &pmem.id {
+                    if let Some(file) = new_cfgs.get(&id.clone()) {
+                        pmem.file = file.to_path_buf();
+                    }
+                }
+            }
+        }
+    }
+
     // Also enables virtio-iommu if the config needs it
     // Returns the list of unique identifiers provided through the
     // configuration.
@@ -1832,9 +2423,18 @@ impl VmConfig {
             }
         }
 
+        // The 'conflict' check is introduced in commit 24438e0390d3
+        // (vm-virtio: Enable the vmm support for virtio-console).
+        //
+        // Allow simultaneously set serial and console as TTY mode, for
+        // someone want to use virtio console for better performance, and
+        // want to keep legacy serial to catch boot stage logs for debug.
+        // Using such double tty mode, you need to configure the kernel
+        // properly, such as:
+        // "console=hvc0 earlyprintk=ttyS0"
         if self.console.mode == ConsoleOutputMode::Tty && self.serial.mode == ConsoleOutputMode::Tty
         {
-            return Err(ValidationError::DoubleTtyMode);
+            warn!("Using TTY output for both virtio-console and serial port");
         }
 
         if self.console.mode == ConsoleOutputMode::File && self.console.file.is_none() {
@@ -1880,9 +2480,6 @@ impl VmConfig {
         }
 
         if let Some(fses) = &self.fs {
-            if !fses.is_empty() && !self.backed_by_shared_memory() {
-                return Err(ValidationError::VhostUserRequiresSharedMemory);
-            }
             for fs in fses {
                 fs.validate(self)?;
 
@@ -2169,6 +2766,12 @@ impl VmConfig {
             });
         }
 
+        let mut ivshmem: Option<IvshmemConfig> = None;
+        if let Some(iv) = vm_params.ivshmem {
+            let ivshmem_conf = IvshmemConfig::parse(iv)?;
+            ivshmem = Some(ivshmem_conf);
+        }
+
         #[cfg(feature = "guest_debug")]
         let gdb = vm_params.gdb;
 
@@ -2188,6 +2791,7 @@ impl VmConfig {
             user_devices,
             vdpa,
             vsock,
+            pvpanic: vm_params.pvpanic,
             iommu: false, // updated in VmConfig::validate()
             #[cfg(target_arch = "x86_64")]
             sgx_epc,
@@ -2197,6 +2801,8 @@ impl VmConfig {
             gdb,
             platform,
             tpm,
+            sys_ctrl: vm_params.sys_ctrl,
+            ivshmem,
         };
         config.validate().map_err(Error::Validation)?;
         Ok(config)
@@ -2605,6 +3211,7 @@ mod tests {
             ConsoleConfig {
                 mode: ConsoleOutputMode::Off,
                 iommu: false,
+                sigwinch: false,
                 file: None,
             }
         );
@@ -2613,6 +3220,7 @@ mod tests {
             ConsoleConfig {
                 mode: ConsoleOutputMode::Pty,
                 iommu: false,
+                sigwinch: false,
                 file: None,
             }
         );
@@ -2621,6 +3229,7 @@ mod tests {
             ConsoleConfig {
                 mode: ConsoleOutputMode::Tty,
                 iommu: false,
+                sigwinch: false,
                 file: None,
             }
         );
@@ -2629,6 +3238,7 @@ mod tests {
             ConsoleConfig {
                 mode: ConsoleOutputMode::Null,
                 iommu: false,
+                sigwinch: false,
                 file: None,
             }
         );
@@ -2637,6 +3247,7 @@ mod tests {
             ConsoleConfig {
                 mode: ConsoleOutputMode::File,
                 iommu: false,
+                sigwinch: false,
                 file: Some(PathBuf::from("/tmp/console"))
             }
         );
@@ -2645,6 +3256,7 @@ mod tests {
             ConsoleConfig {
                 mode: ConsoleOutputMode::Null,
                 iommu: true,
+                sigwinch: false,
                 file: None,
             }
         );
@@ -2653,6 +3265,7 @@ mod tests {
             ConsoleConfig {
                 mode: ConsoleOutputMode::File,
                 iommu: true,
+                sigwinch: false,
                 file: Some(PathBuf::from("/tmp/console"))
             }
         );
@@ -2781,6 +3394,7 @@ mod tests {
                 prefault: false,
                 zones: None,
                 thp: true,
+                dirty_log: false,
             },
             payload: Some(PayloadConfig {
                 kernel: Some(PathBuf::from("/path/to/kernel")),
@@ -2798,17 +3412,20 @@ mod tests {
             serial: ConsoleConfig {
                 file: None,
                 mode: ConsoleOutputMode::Null,
+                sigwinch: false,
                 iommu: false,
             },
             console: ConsoleConfig {
                 file: None,
                 mode: ConsoleOutputMode::Tty,
+                sigwinch: false,
                 iommu: false,
             },
             devices: None,
             user_devices: None,
             vdpa: None,
             vsock: None,
+            pvpanic: false,
             iommu: false,
             #[cfg(target_arch = "x86_64")]
             sgx_epc: None,
@@ -2818,6 +3435,8 @@ mod tests {
             gdb: false,
             platform: None,
             tpm: None,
+            sys_ctrl: false,
+            ivshmem: None,
         };
 
         assert!(valid_config.validate().is_ok());
@@ -2825,10 +3444,7 @@ mod tests {
         let mut invalid_config = valid_config.clone();
         invalid_config.serial.mode = ConsoleOutputMode::Tty;
         invalid_config.console.mode = ConsoleOutputMode::Tty;
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::DoubleTtyMode)
-        );
+        assert!(valid_config.validate().is_ok());
 
         let mut invalid_config = valid_config.clone();
         invalid_config.payload = None;
