@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 use std::sync::Arc;
+mod cpuid_filter;
 pub mod interrupts;
 pub mod layout;
 mod mpspec;
@@ -15,16 +16,15 @@ pub mod regs;
 use crate::GuestMemoryMmap;
 use crate::InitramfsConfig;
 use crate::RegionType;
-use hypervisor::arch::x86::{CpuIdEntry, CPUID_FLAG_VALID_INDEX};
+use hypervisor::arch::x86::{CpuIdCustomEntry, CpuIdEntry, CPUID_FLAG_VALID_INDEX};
 use hypervisor::HypervisorError;
-use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::start_info::{
     hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
 };
 use std::collections::BTreeMap;
 use std::mem;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
+    Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
     GuestMemoryRegion, GuestUsize,
 };
 mod smbios;
@@ -36,6 +36,9 @@ pub mod tdx;
 const TSC_DEADLINE_TIMER_ECX_BIT: u8 = 24; // tsc deadline timer ecx bit.
 const HYPERVISOR_ECX_BIT: u8 = 31; // Hypervisor ecx bit.
 const MTRR_EDX_BIT: u8 = 12; // Hypervisor ecx bit.
+
+const CUBE_CPUID_COMPAT_FILE: &str =
+    "/usr/local/services/cubetoolbox/cube-snapshot/cpuid_compatible.json";
 
 // KVM feature bits
 const KVM_FEATURE_ASYNC_PF_INT_BIT: u8 = 14;
@@ -111,36 +114,6 @@ impl SgxEpcRegion {
     }
 }
 
-// This is a workaround to the Rust enforcement specifying that any implementation of a foreign
-// trait (in this case `DataInit`) where:
-// *    the type that is implementing the trait is foreign or
-// *    all of the parameters being passed to the trait (if there are any) are also foreign
-// is prohibited.
-#[derive(Copy, Clone, Default)]
-struct StartInfoWrapper(hvm_start_info);
-
-#[derive(Copy, Clone, Default)]
-struct MemmapTableEntryWrapper(hvm_memmap_table_entry);
-
-#[derive(Copy, Clone, Default)]
-struct ModlistEntryWrapper(hvm_modlist_entry);
-
-// SAFETY: These data structures only contain a series of integers
-unsafe impl ByteValued for StartInfoWrapper {}
-unsafe impl ByteValued for MemmapTableEntryWrapper {}
-unsafe impl ByteValued for ModlistEntryWrapper {}
-
-// This is a workaround to the Rust enforcement specifying that any implementation of a foreign
-// trait (in this case `DataInit`) where:
-// *    the type that is implementing the trait is foreign or
-// *    all of the parameters being passed to the trait (if there are any) are also foreign
-// is prohibited.
-#[derive(Copy, Clone, Default)]
-struct BootParamsWrapper(boot_params);
-
-// SAFETY: BootParamsWrap is a wrapper over `boot_params` (a series of ints).
-unsafe impl ByteValued for BootParamsWrapper {}
-
 #[derive(Debug)]
 pub enum Error {
     /// Error writing MP table to memory.
@@ -203,7 +176,7 @@ impl From<Error> for super::Error {
 }
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CpuidReg {
     EAX,
     EBX,
@@ -305,6 +278,43 @@ impl CpuidPatch {
         }
     }
 
+    pub fn intersect_cpuid(cpuid: &mut [CpuIdEntry], patches: Vec<CpuIdCustomEntry>) {
+        for entry in cpuid {
+            for patch in patches.iter() {
+                if entry.function == patch.function && entry.index == patch.index {
+                    if CpuidFeatureEntry::entry_need_intersect(
+                        entry.function,
+                        entry.index,
+                        CpuidReg::EAX,
+                    ) {
+                        entry.eax &= patch.eax;
+                    }
+                    if CpuidFeatureEntry::entry_need_intersect(
+                        entry.function,
+                        entry.index,
+                        CpuidReg::EBX,
+                    ) {
+                        entry.ebx &= patch.ebx;
+                    }
+                    if CpuidFeatureEntry::entry_need_intersect(
+                        entry.function,
+                        entry.index,
+                        CpuidReg::ECX,
+                    ) {
+                        entry.ecx &= patch.ecx;
+                    }
+                    if CpuidFeatureEntry::entry_need_intersect(
+                        entry.function,
+                        entry.index,
+                        CpuidReg::EDX,
+                    ) {
+                        entry.edx &= patch.edx;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn is_feature_enabled(
         cpuid: &[CpuIdEntry],
         function: u32,
@@ -331,7 +341,7 @@ impl CpuidPatch {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum CpuidCompatibleCheck {
     BitwiseSubset, // bitwise subset
     Equal,         // equal in value
@@ -542,8 +552,77 @@ impl CpuidFeatureEntry {
             Err(Error::CpuidCheckCompatibility)
         }
     }
+
+    pub fn entry_need_intersect(function: u32, index: u32, reg: CpuidReg) -> bool {
+        let feature_entry_list = &Self::checked_feature_entry_list();
+        for entry in feature_entry_list {
+            if function == entry.function
+                && index == entry.index
+                && reg == entry.feature_reg
+                && CpuidCompatibleCheck::BitwiseSubset == entry.compatible_check
+            {
+                debug!("intersect cpuid function 0x{:x} reg {:?}", function, reg);
+                return true;
+            }
+        }
+        false
+    }
 }
 
+// Get a static CPU template stored as a JSON file.
+pub fn get_json_template() -> Vec<CpuIdCustomEntry> {
+    if std::fs::metadata(CUBE_CPUID_COMPAT_FILE).is_ok() {
+        debug!("compatilbe cpuid file {:?}", CUBE_CPUID_COMPAT_FILE);
+        serde_json::from_str(&std::fs::read_to_string(CUBE_CPUID_COMPAT_FILE).unwrap()).unwrap()
+    } else {
+        debug!("not found cpuid compatible json file");
+        Vec::new()
+    }
+}
+
+pub fn generate_compatible_cpuid() -> cpuid_filter::CustomCpuId {
+    cpuid_filter::CustomCpuId {
+        cpuids: get_json_template(),
+    }
+}
+
+const XSAVE_HDR_SIZE: u32 = 64;
+const XSAVE_HDR_OFFSET: u32 = 512;
+
+// from kernel arch/x86/include/asm/fpu/types.h
+const XFEATURE_FP: u32 = 0;
+const XFEATURE_SSE: u32 = 1;
+const XFEATURE_MASK_FP: u32 = 1 << XFEATURE_FP;
+const XFEATURE_MASK_SSE: u32 = 1 << XFEATURE_SSE;
+const XFEATURE_MASK_FPSSE: u32 = XFEATURE_MASK_FP | XFEATURE_MASK_SSE;
+const XFEATURE_MASK_EXTEND: u32 = !(XFEATURE_MASK_FPSSE | (1 << 31));
+
+pub fn xstate_required_size(xstate: u32) -> u32 {
+    let mut feature_bit = 0;
+    let mut ret = XSAVE_HDR_SIZE + XSAVE_HDR_OFFSET;
+    let mut xstate_bv = xstate & XFEATURE_MASK_EXTEND;
+
+    debug!(
+        "mask extend 0x{:x} bv 0x{:x} xstate 0x{:x}",
+        XFEATURE_MASK_EXTEND, xstate_bv, xstate
+    );
+
+    while xstate_bv != 0 {
+        if xstate_bv & 0x1 != 0 {
+            // SAFETY: call cpuid with valid leaves
+            let leaf = unsafe { std::arch::x86_64::__cpuid_count(0xd, feature_bit) };
+            ret = std::cmp::max(ret, leaf.eax + leaf.ebx);
+            debug!("xstate 0x{:x} ret 0x{:x} leaf {:x?}", xstate_bv, ret, leaf);
+        }
+
+        xstate_bv >>= 1;
+        feature_bit += 1;
+    }
+
+    ret
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn generate_common_cpuid(
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     topology: Option<(u8, u8, u8)>,
@@ -551,6 +630,8 @@ pub fn generate_common_cpuid(
     phys_bits: u8,
     kvm_hyperv: bool,
     #[cfg(feature = "tdx")] tdx_enabled: bool,
+    vendor_compatible: bool,
+    arch_compatible: bool,
 ) -> super::Result<Vec<CpuIdEntry>> {
     let cpuid_patches = vec![
         // Patch tsc deadline timer bit
@@ -587,6 +668,17 @@ pub fn generate_common_cpuid(
 
     // Supported CPUID
     let mut cpuid = hypervisor.get_cpuid().map_err(Error::CpuidGetSupported)?;
+    debug!("cpuid from hypervisor {:x?}", cpuid);
+
+    if vendor_compatible {
+        let cpuid_compatible = generate_compatible_cpuid();
+        debug!("cpuid from vendor compatible {:x?}", cpuid_compatible);
+
+        if !cpuid_compatible.cpuids.is_empty() {
+            CpuidPatch::intersect_cpuid(&mut cpuid, cpuid_compatible.cpuids);
+            debug!("cpuid vendor compatible {:x?}", cpuid);
+        }
+    }
 
     CpuidPatch::patch_cpuid(&mut cpuid, cpuid_patches);
 
@@ -716,6 +808,18 @@ pub fn generate_common_cpuid(
                 function: i,
                 ..Default::default()
             });
+        }
+    }
+
+    if arch_compatible {
+        cpuid_filter::apply_compatible_template(&mut cpuid);
+        debug!("cpuid arch compatible {:x?}", cpuid);
+
+        for entry in cpuid.as_mut_slice().iter_mut() {
+            if 0xd == entry.function && entry.index == 0 {
+                entry.ecx = xstate_required_size(entry.eax);
+                debug!("ecx {:x}", entry.ecx);
+            }
         }
     }
 
@@ -860,29 +964,30 @@ fn configure_pvh(
 ) -> super::Result<()> {
     const XEN_HVM_START_MAGIC_VALUE: u32 = 0x336ec578;
 
-    let mut start_info: StartInfoWrapper = StartInfoWrapper(hvm_start_info::default());
-
-    start_info.0.magic = XEN_HVM_START_MAGIC_VALUE;
-    start_info.0.version = 1; // pvh has version 1
-    start_info.0.nr_modules = 0;
-    start_info.0.cmdline_paddr = cmdline_addr.raw_value();
-    start_info.0.memmap_paddr = layout::MEMMAP_START.raw_value();
+    let mut start_info = hvm_start_info {
+        magic: XEN_HVM_START_MAGIC_VALUE,
+        version: 1, // pvh has version 1
+        nr_modules: 0,
+        cmdline_paddr: cmdline_addr.raw_value(),
+        memmap_paddr: layout::MEMMAP_START.raw_value(),
+        ..Default::default()
+    };
 
     if let Some(rsdp_addr) = rsdp_addr {
-        start_info.0.rsdp_paddr = rsdp_addr.0;
+        start_info.rsdp_paddr = rsdp_addr.0;
     }
 
     if let Some(initramfs_config) = initramfs {
         // The initramfs has been written to guest memory already, here we just need to
         // create the module structure that describes it.
-        let ramdisk_mod: ModlistEntryWrapper = ModlistEntryWrapper(hvm_modlist_entry {
+        let ramdisk_mod = hvm_modlist_entry {
             paddr: initramfs_config.address.raw_value(),
             size: initramfs_config.size as u64,
             ..Default::default()
-        });
+        };
 
-        start_info.0.nr_modules += 1;
-        start_info.0.modlist_paddr = layout::MODLIST_START.raw_value();
+        start_info.nr_modules += 1;
+        start_info.modlist_paddr = layout::MODLIST_START.raw_value();
 
         // Write the modlist struct to guest memory.
         guest_mem
@@ -939,7 +1044,7 @@ fn configure_pvh(
         );
     }
 
-    start_info.0.memmap_entries = memmap.len() as u32;
+    start_info.memmap_entries = memmap.len() as u32;
 
     // Copy the vector with the memmap table to the MEMMAP_START address
     // which is already saved in the memmap_paddr field of hvm_start_info struct.
@@ -948,17 +1053,14 @@ fn configure_pvh(
     guest_mem
         .checked_offset(
             memmap_start_addr,
-            mem::size_of::<hvm_memmap_table_entry>() * start_info.0.memmap_entries as usize,
+            mem::size_of::<hvm_memmap_table_entry>() * start_info.memmap_entries as usize,
         )
         .ok_or(super::Error::MemmapTablePastRamEnd)?;
 
-    // For every entry in the memmap vector, create a MemmapTableEntryWrapper
-    // and write it to guest memory.
+    // For every entry in the memmap vector, write it to guest memory.
     for memmap_entry in memmap {
-        let map_entry_wrapper: MemmapTableEntryWrapper = MemmapTableEntryWrapper(memmap_entry);
-
         guest_mem
-            .write_obj(map_entry_wrapper, memmap_start_addr)
+            .write_obj(memmap_entry, memmap_start_addr)
             .map_err(|_| super::Error::MemmapTableSetup)?;
         memmap_start_addr =
             memmap_start_addr.unchecked_add(mem::size_of::<hvm_memmap_table_entry>() as u64);
