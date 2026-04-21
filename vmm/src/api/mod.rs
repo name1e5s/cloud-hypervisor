@@ -30,38 +30,34 @@
 
 pub use self::http::start_http_fd_thread;
 pub use self::http::start_http_path_thread;
+use core::fmt;
+use std::fmt::Display;
 
 pub mod http;
-pub mod http_endpoint;
+pub mod service;
 
-use crate::config::{
-    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig, UserDeviceConfig,
-    VdpaConfig, VmConfig, VsockConfig,
-};
+use crate::api::service::VMM_SERVICE;
+use crate::config::RestoreConfig;
 use crate::device_tree::DeviceTree;
 use crate::vm::{Error as VmError, VmState};
+use crate::vm_config::{
+    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig, VdpaConfig,
+    VmConfig, VsockConfig,
+};
 use micro_http::Body;
 use serde::{Deserialize, Serialize};
-use std::io;
-use std::sync::mpsc::{channel, RecvError, SendError, Sender};
+use service::Error as VmmServiceError;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use vm_migration::MigratableError;
-use vmm_sys_util::eventfd::EventFd;
+
+pub const SNAPSHOT_VERSION: &str = "1.0.3";
 
 /// API errors are sent back from the VMM API server through the ApiResponse.
 #[derive(Debug)]
 pub enum ApiError {
-    /// Cannot write to EventFd.
-    EventFdWrite(io::Error),
-
-    /// API request send error
-    RequestSend(SendError<ApiRequest>),
-
     /// Wrong response payload type
     ResponsePayloadType,
-
-    /// API response receive error
-    ResponseRecv(RecvError),
 
     /// The VM could not boot.
     VmBoot(VmError),
@@ -78,8 +74,14 @@ pub enum ApiError {
     /// The VM could not be paused.
     VmPause(VmError),
 
+    /// The VM could not be paused or snapshot or deleted.
+    VmPauseToSnapshot(VmError),
+
     /// The VM could not resume.
     VmResume(VmError),
+
+    /// The VM could not be restored or resumed.
+    VmResumeFromSnapshot(VmError),
 
     /// The VM is not booted.
     VmNotBooted,
@@ -132,6 +134,9 @@ pub enum ApiError {
     /// The fs could not be added to the VM.
     VmAddFs(VmError),
 
+    /// The fs could not be added to the VM.
+    VmSetFs(VmError),
+
     /// The pmem device could not be added to the VM.
     VmAddPmem(VmError),
 
@@ -152,8 +157,52 @@ pub enum ApiError {
 
     /// Error triggering power button
     VmPowerButton(VmError),
+    Service(VmmServiceError),
 }
 pub type ApiResult<T> = std::result::Result<T, ApiError>;
+
+impl Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::ApiError::*;
+        match self {
+            ResponsePayloadType => write!(f, "Wrong response payload type"),
+            VmBoot(vm_error) => write!(f, "{}", vm_error),
+            VmCreate(vm_error) => write!(f, "{}", vm_error),
+            VmDelete(vm_error) => write!(f, "{}", vm_error),
+            VmInfo(vm_error) => write!(f, "{}", vm_error),
+            VmPause(vm_error) => write!(f, "{}", vm_error),
+            VmPauseToSnapshot(vm_error) => write!(f, "{}", vm_error),
+            VmResume(vm_error) => write!(f, "{}", vm_error),
+            VmResumeFromSnapshot(vm_error) => write!(f, "{}", vm_error),
+            VmNotBooted => write!(f, "VM is not booted"),
+            VmNotCreated => write!(f, "VM is not created"),
+            VmShutdown(vm_error) => write!(f, "{}", vm_error),
+            VmReboot(vm_error) => write!(f, "{}", vm_error),
+            VmSnapshot(vm_error) => write!(f, "{}", vm_error),
+            VmRestore(vm_error) => write!(f, "{}", vm_error),
+            VmCoredump(vm_error) => write!(f, "{}", vm_error),
+            VmmShutdown(vm_error) => write!(f, "{}", vm_error),
+            VmResize(vm_error) => write!(f, "{}", vm_error),
+            VmResizeZone(vm_error) => write!(f, "{}", vm_error),
+            VmAddDevice(vm_error) => write!(f, "{}", vm_error),
+            VmAddUserDevice(vm_error) => write!(f, "{}", vm_error),
+            VmRemoveDevice(vm_error) => write!(f, "{}", vm_error),
+            CreateSeccompFilter(seccomp_error) => write!(f, "{}", seccomp_error),
+            ApplySeccompFilter(seccomp_error) => write!(f, "{}", seccomp_error),
+            VmAddDisk(vm_error) => write!(f, "{}", vm_error),
+            VmAddFs(vm_error) => write!(f, "{}", vm_error),
+            VmAddPmem(vm_error) => write!(f, "{}", vm_error),
+            VmAddNet(vm_error) => write!(f, "{}", vm_error),
+            VmAddVdpa(vm_error) => write!(f, "{}", vm_error),
+            VmAddVsock(vm_error) => write!(f, "{}", vm_error),
+            VmReceiveMigration(migratable_error) => write!(f, "{}", migratable_error),
+            VmSendMigration(migratable_error) => write!(f, "{}", migratable_error),
+            VmPowerButton(vm_error) => write!(f, "{}", vm_error),
+            VmSetFs(vm_error) => write!(f, "{}", vm_error),
+            Service(service_error) => write!(f, "{}", service_error),
+        }
+    }
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct VmInfo {
@@ -166,6 +215,11 @@ pub struct VmInfo {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct VmmPingResponse {
     pub version: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct VmWaitStartResponse {
+    pub started: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -223,6 +277,9 @@ pub enum ApiResponsePayload {
     /// Vmm ping response
     VmmPing(VmmPingResponse),
 
+    /// Vmm wait response
+    VmWaitStart(VmWaitStartResponse),
+
     /// Vm action response
     VmAction(Option<Vec<u8>>),
 }
@@ -237,116 +294,121 @@ pub enum ApiRequest {
     /// (VmConfig).
     /// If the VMM API server could not create the VM, it will send a VmCreate
     /// error back.
-    VmCreate(Arc<Mutex<VmConfig>>, Sender<ApiResponse>),
+    VmCreate(Box<VmConfig>),
 
     /// Boot the previously created virtual machine.
     /// If the VM was not previously created, the VMM API server will send a
     /// VmBoot error back.
-    VmBoot(Sender<ApiResponse>),
+    VmBoot,
 
     /// Delete the previously created virtual machine.
     /// If the VM was not previously created, the VMM API server will send a
     /// VmDelete error back.
     /// If the VM is booted, we shut it down first.
-    VmDelete(Sender<ApiResponse>),
+    VmDelete,
 
     /// Request the VM information.
-    VmInfo(Sender<ApiResponse>),
+    VmInfo,
 
     /// Request the VMM API server status
-    VmmPing(Sender<ApiResponse>),
+    VmmPing,
 
     /// Pause a VM.
-    VmPause(Sender<ApiResponse>),
+    VmPause,
+
+    /// Pause a VM to snapshot
+    VmPauseToSnapshot(Arc<VmSnapshotConfig>),
+
+    /// Resume a VM from snapshot
+    VmResumeFromSnapshot(Arc<RestoreConfig>),
 
     /// Resume a VM.
-    VmResume(Sender<ApiResponse>),
+    VmResume,
+
+    /// Wait vm started.
+    VmWaitStart,
 
     /// Get counters for a VM.
-    VmCounters(Sender<ApiResponse>),
+    VmCounters,
 
     /// Shut the previously booted virtual machine down.
     /// If the VM was not previously booted or created, the VMM API server
     /// will send a VmShutdown error back.
-    VmShutdown(Sender<ApiResponse>),
+    VmShutdown,
 
     /// Reboot the previously booted virtual machine.
     /// If the VM was not previously booted or created, the VMM API server
     /// will send a VmReboot error back.
-    VmReboot(Sender<ApiResponse>),
+    VmReboot,
 
     /// Shut the VMM down.
     /// This will shutdown and delete the current VM, if any, and then exit the
     /// VMM process.
-    VmmShutdown(Sender<ApiResponse>),
+    VmmShutdown,
 
     /// Resize the VM.
-    VmResize(Arc<VmResizeData>, Sender<ApiResponse>),
+    VmResize(Arc<VmResizeData>),
 
     /// Resize the memory zone.
-    VmResizeZone(Arc<VmResizeZoneData>, Sender<ApiResponse>),
+    VmResizeZone(Arc<VmResizeZoneData>),
 
     /// Add a device to the VM.
-    VmAddDevice(Arc<DeviceConfig>, Sender<ApiResponse>),
+    VmAddDevice(Arc<DeviceConfig>),
 
     /// Add a user device to the VM.
-    VmAddUserDevice(Arc<UserDeviceConfig>, Sender<ApiResponse>),
+    VmAddUserDevice(Arc<UserDeviceConfig>),
 
     /// Remove a device from the VM.
-    VmRemoveDevice(Arc<VmRemoveDeviceData>, Sender<ApiResponse>),
+    VmRemoveDevice(Arc<VmRemoveDeviceData>),
 
     /// Add a disk to the VM.
-    VmAddDisk(Arc<DiskConfig>, Sender<ApiResponse>),
+    VmAddDisk(Arc<DiskConfig>),
 
     /// Add a fs to the VM.
-    VmAddFs(Arc<FsConfig>, Sender<ApiResponse>),
-
-    /// Add a pmem device to the VM.
-    VmAddPmem(Arc<PmemConfig>, Sender<ApiResponse>),
-
-    /// Add a network device to the VM.
-    VmAddNet(Arc<NetConfig>, Sender<ApiResponse>),
-
-    /// Add a vDPA device to the VM.
-    VmAddVdpa(Arc<VdpaConfig>, Sender<ApiResponse>),
+    VmAddFs(Arc<FsConfig>),
 
     /// Add a vsock device to the VM.
-    VmAddVsock(Arc<VsockConfig>, Sender<ApiResponse>),
+    VmSetFs(Arc<FsConfig>),
+
+    /// Add a pmem device to the VM.
+    VmAddPmem(Arc<PmemConfig>),
+
+    /// Add a network device to the VM.
+    VmAddNet(Arc<NetConfig>),
+
+    /// Add a vDPA device to the VM.
+    VmAddVdpa(Arc<VdpaConfig>),
+
+    /// Add a vsock device to the VM.
+    VmAddVsock(Arc<VsockConfig>),
 
     /// Take a VM snapshot
-    VmSnapshot(Arc<VmSnapshotConfig>, Sender<ApiResponse>),
+    VmSnapshot(Arc<VmSnapshotConfig>),
 
     /// Restore from a VM snapshot
-    VmRestore(Arc<RestoreConfig>, Sender<ApiResponse>),
+    VmRestore(Arc<RestoreConfig>),
 
     /// Take a VM coredump
-    #[cfg(feature = "guest_debug")]
-    VmCoredump(Arc<VmCoredumpData>, Sender<ApiResponse>),
+    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+    VmCoredump(Arc<VmCoredumpData>),
 
     /// Incoming migration
-    VmReceiveMigration(Arc<VmReceiveMigrationData>, Sender<ApiResponse>),
+    VmReceiveMigration(Arc<VmReceiveMigrationData>),
 
     /// Outgoing migration
-    VmSendMigration(Arc<VmSendMigrationData>, Sender<ApiResponse>),
+    VmSendMigration(Arc<VmSendMigrationData>),
 
     // Trigger power button
-    VmPowerButton(Sender<ApiResponse>),
+    VmPowerButton,
 }
 
-pub fn vm_create(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    config: Arc<Mutex<VmConfig>>,
-) -> ApiResult<()> {
-    let (response_sender, response_receiver) = channel();
-
+pub fn vm_create(config: Box<VmConfig>) -> ApiResult<()> {
     // Send the VM creation request.
-    api_sender
-        .send(ApiRequest::VmCreate(config, response_sender))
-        .map_err(ApiError::RequestSend)?;
-    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
-
-    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+    VMM_SERVICE
+        .lock()
+        .unwrap()
+        .send_request(ApiRequest::VmCreate(config))
+        .map_err(ApiError::Service)??;
 
     Ok(())
 }
@@ -373,6 +435,12 @@ pub enum VmAction {
     /// Resume a VM
     Resume,
 
+    /// Snapshot VM
+    PauseToSnapshot(Arc<VmSnapshotConfig>),
+
+    /// Restore VM
+    ResumeFromSnapshot(Arc<RestoreConfig>),
+
     /// Return VM counters
     Counters,
 
@@ -384,6 +452,9 @@ pub enum VmAction {
 
     /// Add filesystem
     AddFs(Arc<FsConfig>),
+
+    /// Add filesystem
+    SetFs(Arc<FsConfig>),
 
     /// Add pmem
     AddPmem(Arc<PmemConfig>),
@@ -429,47 +500,45 @@ pub enum VmAction {
     PowerButton,
 }
 
-fn vm_action(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    action: VmAction,
-) -> ApiResult<Option<Body>> {
-    let (response_sender, response_receiver) = channel();
-
+fn vm_action(action: VmAction) -> ApiResult<Option<Body>> {
     use VmAction::*;
     let request = match action {
-        Boot => ApiRequest::VmBoot(response_sender),
-        Delete => ApiRequest::VmDelete(response_sender),
-        Shutdown => ApiRequest::VmShutdown(response_sender),
-        Reboot => ApiRequest::VmReboot(response_sender),
-        Pause => ApiRequest::VmPause(response_sender),
-        Resume => ApiRequest::VmResume(response_sender),
-        Counters => ApiRequest::VmCounters(response_sender),
-        AddDevice(v) => ApiRequest::VmAddDevice(v, response_sender),
-        AddDisk(v) => ApiRequest::VmAddDisk(v, response_sender),
-        AddFs(v) => ApiRequest::VmAddFs(v, response_sender),
-        AddPmem(v) => ApiRequest::VmAddPmem(v, response_sender),
-        AddNet(v) => ApiRequest::VmAddNet(v, response_sender),
-        AddVdpa(v) => ApiRequest::VmAddVdpa(v, response_sender),
-        AddVsock(v) => ApiRequest::VmAddVsock(v, response_sender),
-        AddUserDevice(v) => ApiRequest::VmAddUserDevice(v, response_sender),
-        RemoveDevice(v) => ApiRequest::VmRemoveDevice(v, response_sender),
-        Resize(v) => ApiRequest::VmResize(v, response_sender),
-        ResizeZone(v) => ApiRequest::VmResizeZone(v, response_sender),
-        Restore(v) => ApiRequest::VmRestore(v, response_sender),
-        Snapshot(v) => ApiRequest::VmSnapshot(v, response_sender),
-        #[cfg(feature = "guest_debug")]
-        Coredump(v) => ApiRequest::VmCoredump(v, response_sender),
-        ReceiveMigration(v) => ApiRequest::VmReceiveMigration(v, response_sender),
-        SendMigration(v) => ApiRequest::VmSendMigration(v, response_sender),
-        PowerButton => ApiRequest::VmPowerButton(response_sender),
+        Boot => ApiRequest::VmBoot,
+        Delete => ApiRequest::VmDelete,
+        Shutdown => ApiRequest::VmShutdown,
+        Reboot => ApiRequest::VmReboot,
+        Pause => ApiRequest::VmPause,
+        Resume => ApiRequest::VmResume,
+        PauseToSnapshot(v) => ApiRequest::VmPauseToSnapshot(v),
+        ResumeFromSnapshot(v) => ApiRequest::VmResumeFromSnapshot(v),
+        Counters => ApiRequest::VmCounters,
+        AddDevice(v) => ApiRequest::VmAddDevice(v),
+        AddDisk(v) => ApiRequest::VmAddDisk(v),
+        AddFs(v) => ApiRequest::VmAddFs(v),
+        SetFs(v) => ApiRequest::VmSetFs(v),
+        AddPmem(v) => ApiRequest::VmAddPmem(v),
+        AddNet(v) => ApiRequest::VmAddNet(v),
+        AddVdpa(v) => ApiRequest::VmAddVdpa(v),
+        AddVsock(v) => ApiRequest::VmAddVsock(v),
+        AddUserDevice(v) => ApiRequest::VmAddUserDevice(v),
+        RemoveDevice(v) => ApiRequest::VmRemoveDevice(v),
+        Resize(v) => ApiRequest::VmResize(v),
+        ResizeZone(v) => ApiRequest::VmResizeZone(v),
+        Restore(v) => ApiRequest::VmRestore(v),
+        Snapshot(v) => ApiRequest::VmSnapshot(v),
+        #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+        Coredump(v) => ApiRequest::VmCoredump(v),
+        ReceiveMigration(v) => ApiRequest::VmReceiveMigration(v),
+        SendMigration(v) => ApiRequest::VmSendMigration(v),
+        PowerButton => ApiRequest::VmPowerButton,
     };
 
-    // Send the VM request.
-    api_sender.send(request).map_err(ApiError::RequestSend)?;
-    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
-
-    let body = match response_receiver.recv().map_err(ApiError::ResponseRecv)?? {
+    let body = match VMM_SERVICE
+        .lock()
+        .unwrap()
+        .send_request(request)
+        .map_err(ApiError::Service)??
+    {
         ApiResponsePayload::VmAction(response) => response.map(Body::new),
         ApiResponsePayload::Empty => None,
         _ => return Err(ApiError::ResponsePayloadType),
@@ -478,92 +547,74 @@ fn vm_action(
     Ok(body)
 }
 
-pub fn vm_boot(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Boot)
+pub fn vm_boot() -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Boot)
 }
 
-pub fn vm_delete(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Delete)
+pub fn vm_delete() -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Delete)
 }
 
-pub fn vm_shutdown(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Shutdown)
+pub fn vm_shutdown() -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Shutdown)
 }
 
-pub fn vm_reboot(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Reboot)
+pub fn vm_reboot() -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Reboot)
 }
 
-pub fn vm_pause(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Pause)
+pub fn vm_pause() -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Pause)
 }
 
-pub fn vm_resume(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Resume)
+pub fn vm_resume() -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Resume)
 }
 
-pub fn vm_counters(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Counters)
+pub fn vm_pause2snapshot(data: Arc<VmSnapshotConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::PauseToSnapshot(data))
 }
 
-pub fn vm_power_button(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::PowerButton)
+pub fn vm_resume_from_snapshot(data: Arc<RestoreConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::ResumeFromSnapshot(data))
 }
 
-pub fn vm_receive_migration(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<VmReceiveMigrationData>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::ReceiveMigration(data))
+pub fn vm_counters() -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Counters)
 }
 
-pub fn vm_send_migration(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<VmSendMigrationData>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::SendMigration(data))
+pub fn vm_power_button() -> ApiResult<Option<Body>> {
+    vm_action(VmAction::PowerButton)
 }
 
-pub fn vm_snapshot(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<VmSnapshotConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Snapshot(data))
+pub fn vm_receive_migration(data: Arc<VmReceiveMigrationData>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::ReceiveMigration(data))
 }
 
-pub fn vm_restore(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<RestoreConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Restore(data))
+pub fn vm_send_migration(data: Arc<VmSendMigrationData>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::SendMigration(data))
 }
 
-#[cfg(feature = "guest_debug")]
-pub fn vm_coredump(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<VmCoredumpData>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Coredump(data))
+pub fn vm_snapshot(data: Arc<VmSnapshotConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Snapshot(data))
 }
 
-pub fn vm_info(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<VmInfo> {
-    let (response_sender, response_receiver) = channel();
+pub fn vm_restore(data: Arc<RestoreConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Restore(data))
+}
 
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+pub fn vm_coredump(data: Arc<VmCoredumpData>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Coredump(data))
+}
+
+pub fn vm_info() -> ApiResult<VmInfo> {
     // Send the VM request.
-    api_sender
-        .send(ApiRequest::VmInfo(response_sender))
-        .map_err(ApiError::RequestSend)?;
-    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
-
-    let vm_info = response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+    let vm_info = VMM_SERVICE
+        .lock()
+        .unwrap()
+        .send_request(ApiRequest::VmInfo)
+        .map_err(ApiError::Service)??;
 
     match vm_info {
         ApiResponsePayload::VmInfo(info) => Ok(info),
@@ -571,15 +622,12 @@ pub fn vm_info(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<Vm
     }
 }
 
-pub fn vmm_ping(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<VmmPingResponse> {
-    let (response_sender, response_receiver) = channel();
-
-    api_sender
-        .send(ApiRequest::VmmPing(response_sender))
-        .map_err(ApiError::RequestSend)?;
-    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
-
-    let vmm_pong = response_receiver.recv().map_err(ApiError::ResponseRecv)??;
+pub fn vmm_ping() -> ApiResult<VmmPingResponse> {
+    let vmm_pong = VMM_SERVICE
+        .lock()
+        .unwrap()
+        .send_request(ApiRequest::VmmPing)
+        .map_err(ApiError::Service)??;
 
     match vmm_pong {
         ApiResponsePayload::VmmPing(pong) => Ok(pong),
@@ -587,104 +635,82 @@ pub fn vmm_ping(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<V
     }
 }
 
-pub fn vmm_shutdown(api_evt: EventFd, api_sender: Sender<ApiRequest>) -> ApiResult<()> {
-    let (response_sender, response_receiver) = channel();
-
+pub fn vmm_shutdown() -> ApiResult<()> {
     // Send the VMM shutdown request.
-    api_sender
-        .send(ApiRequest::VmmShutdown(response_sender))
-        .map_err(ApiError::RequestSend)?;
-    api_evt.write(1).map_err(ApiError::EventFdWrite)?;
-
-    response_receiver.recv().map_err(ApiError::ResponseRecv)??;
-
+    VMM_SERVICE
+        .lock()
+        .unwrap()
+        .send_request(ApiRequest::VmmShutdown)
+        .map_err(ApiError::Service)??;
     Ok(())
 }
 
-pub fn vm_resize(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<VmResizeData>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::Resize(data))
+pub fn vm_wait_start() -> ApiResult<VmWaitStartResponse> {
+    loop {
+        let vmm_wait = VMM_SERVICE
+            .lock()
+            .unwrap()
+            .send_request(ApiRequest::VmWaitStart)
+            .map_err(ApiError::Service)??;
+
+        match vmm_wait {
+            ApiResponsePayload::VmWaitStart(wait) => {
+                if wait.started {
+                    return Ok(wait);
+                } else {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            }
+            _ => return Err(ApiError::ResponsePayloadType),
+        }
+    }
 }
 
-pub fn vm_resize_zone(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<VmResizeZoneData>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::ResizeZone(data))
+pub fn vm_resize(data: Arc<VmResizeData>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::Resize(data))
 }
 
-pub fn vm_add_device(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<DeviceConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::AddDevice(data))
+pub fn vm_resize_zone(data: Arc<VmResizeZoneData>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::ResizeZone(data))
 }
 
-pub fn vm_add_user_device(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<UserDeviceConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::AddUserDevice(data))
+pub fn vm_add_device(data: Arc<DeviceConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::AddDevice(data))
 }
 
-pub fn vm_remove_device(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<VmRemoveDeviceData>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::RemoveDevice(data))
+pub fn vm_add_user_device(data: Arc<UserDeviceConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::AddUserDevice(data))
 }
 
-pub fn vm_add_disk(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<DiskConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::AddDisk(data))
+pub fn vm_remove_device(data: Arc<VmRemoveDeviceData>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::RemoveDevice(data))
 }
 
-pub fn vm_add_fs(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<FsConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::AddFs(data))
+pub fn vm_add_disk(data: Arc<DiskConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::AddDisk(data))
 }
 
-pub fn vm_add_pmem(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<PmemConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::AddPmem(data))
+pub fn vm_add_fs(data: Arc<FsConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::AddFs(data))
 }
 
-pub fn vm_add_net(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<NetConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::AddNet(data))
+pub fn vm_set_fs(data: Arc<FsConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::SetFs(data))
 }
 
-pub fn vm_add_vdpa(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<VdpaConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::AddVdpa(data))
+pub fn vm_add_pmem(data: Arc<PmemConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::AddPmem(data))
 }
 
-pub fn vm_add_vsock(
-    api_evt: EventFd,
-    api_sender: Sender<ApiRequest>,
-    data: Arc<VsockConfig>,
-) -> ApiResult<Option<Body>> {
-    vm_action(api_evt, api_sender, VmAction::AddVsock(data))
+pub fn vm_add_net(data: Arc<NetConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::AddNet(data))
+}
+
+pub fn vm_add_vdpa(data: Arc<VdpaConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::AddVdpa(data))
+}
+
+pub fn vm_add_vsock(data: Arc<VsockConfig>) -> ApiResult<Option<Body>> {
+    vm_action(VmAction::AddVsock(data))
 }

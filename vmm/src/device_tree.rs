@@ -6,7 +6,9 @@ use crate::device_manager::PciDeviceHandle;
 use pci::PciBdf;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
+use virtio_devices::fs::FsEvent;
 use vm_device::Resource;
 use vm_migration::Migratable;
 
@@ -21,10 +23,19 @@ pub struct DeviceNode {
     pub pci_bdf: Option<PciBdf>,
     #[serde(skip)]
     pub pci_device_handle: Option<PciDeviceHandle>,
+    #[serde(skip)]
+    pub dev_fd: Option<RawFd>,
+    #[serde(skip)]
+    pub pending_dev_message: Option<Arc<Mutex<Vec<FsEvent>>>>,
 }
 
 impl DeviceNode {
-    pub fn new(id: String, migratable: Option<Arc<Mutex<dyn Migratable>>>) -> Self {
+    pub fn new(
+        id: String,
+        migratable: Option<Arc<Mutex<dyn Migratable>>>,
+        dev_fd: Option<RawFd>,
+        pending_dev_message: Option<Arc<Mutex<Vec<FsEvent>>>>,
+    ) -> Self {
         DeviceNode {
             id,
             resources: Vec::new(),
@@ -33,6 +44,8 @@ impl DeviceNode {
             migratable,
             pci_bdf: None,
             pci_device_handle: None,
+            dev_fd,
+            pending_dev_message,
         }
     }
 }
@@ -40,12 +53,14 @@ impl DeviceNode {
 #[macro_export]
 macro_rules! device_node {
     ($id:ident) => {
-        DeviceNode::new($id.clone(), None)
+        DeviceNode::new($id.clone(), None, None, None)
     };
     ($id:ident, $device:ident) => {
         DeviceNode::new(
             $id.clone(),
             Some(Arc::clone(&$device) as Arc<Mutex<dyn Migratable>>),
+            None,
+            None,
         )
     };
 }
@@ -77,6 +92,12 @@ impl DeviceTree {
     }
     pub fn breadth_first_traversal(&self) -> BftIter {
         BftIter::new(&self.0)
+    }
+    pub fn breadth_first_traversal_parent(&self) -> BftIter {
+        BftIter::new_parent(&self.0)
+    }
+    pub fn breadth_first_traversal_children(&self) -> BftIter {
+        BftIter::new_children(&self.0)
     }
     pub fn pci_devices(&self) -> Vec<&DeviceNode> {
         self.0
@@ -117,6 +138,8 @@ impl<'a> BftIter<'a> {
             }
         }
 
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
         let mut node_layer = nodes.as_slice();
         loop {
             let mut next_node_layer = Vec::new();
@@ -133,6 +156,8 @@ impl<'a> BftIter<'a> {
                 break;
             }
 
+            next_node_layer.sort_by(|a, b| a.id.cmp(&b.id));
+
             let pos = nodes.len();
             nodes.extend(next_node_layer);
 
@@ -140,6 +165,61 @@ impl<'a> BftIter<'a> {
         }
 
         BftIter { nodes }
+    }
+
+    fn new_parent(hash_map: &'a HashMap<String, DeviceNode>) -> Self {
+        let mut nodes = Vec::new();
+
+        for (_, node) in hash_map.iter() {
+            if node.parent.is_none() {
+                nodes.push(node);
+            }
+        }
+
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+        BftIter { nodes }
+    }
+
+    fn new_children(hash_map: &'a HashMap<String, DeviceNode>) -> Self {
+        let mut nodes = Vec::new();
+        let mut nodes_children = Vec::new();
+
+        for (_, node) in hash_map.iter() {
+            if node.parent.is_none() {
+                nodes.push(node);
+            }
+        }
+
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut node_layer = nodes.as_slice();
+        loop {
+            let mut next_node_layer = Vec::new();
+
+            for node in node_layer.iter() {
+                for child_node_id in node.children.iter() {
+                    if let Some(child_node) = hash_map.get(child_node_id) {
+                        next_node_layer.push(child_node);
+                    }
+                }
+            }
+
+            if next_node_layer.is_empty() {
+                break;
+            }
+
+            next_node_layer.sort_by(|a, b| a.id.cmp(&b.id));
+
+            let pos = nodes.len();
+            nodes_children.extend(next_node_layer);
+
+            node_layer = &nodes[pos..];
+        }
+
+        BftIter {
+            nodes: nodes_children,
+        }
     }
 }
 
@@ -173,7 +253,7 @@ mod tests {
 
         // Check insert()
         let id = String::from("id1");
-        device_tree.insert(id.clone(), DeviceNode::new(id.clone(), None));
+        device_tree.insert(id.clone(), DeviceNode::new(id.clone(), None, None, None));
         assert_eq!(device_tree.0.len(), 1);
         let node = device_tree.0.get(&id);
         assert!(node.is_some());

@@ -2,10 +2,20 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
-use net_util::MacAddr;
+pub use net_util::MacAddr;
+
 use serde::{Deserialize, Serialize};
 use std::{net::Ipv4Addr, path::PathBuf};
+use virtio_devices::fs::BackendFsConfig;
 use virtio_devices::RateLimiterConfig;
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum CompatibleMode {
+    #[default]
+    Vendor,
+    Max,
+    Ignore,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CpuAffinity {
@@ -51,6 +61,8 @@ pub struct CpusConfig {
     pub affinity: Option<Vec<CpuAffinity>>,
     #[serde(default)]
     pub features: CpuFeatures,
+    #[serde(default)]
+    pub compatible: CompatibleMode,
 }
 
 pub const DEFAULT_VCPUS: u8 = 1;
@@ -65,6 +77,7 @@ impl Default for CpusConfig {
             max_phys_bits: DEFAULT_MAX_PHYS_BITS,
             affinity: None,
             features: CpuFeatures::default(),
+            compatible: CompatibleMode::Vendor,
         }
     }
 }
@@ -166,6 +179,8 @@ pub struct MemoryConfig {
     pub zones: Option<Vec<MemoryZoneConfig>>,
     #[serde(default = "default_memoryconfig_thp")]
     pub thp: bool,
+    #[serde(default)]
+    pub dirty_log: bool,
 }
 
 pub const DEFAULT_MEMORY_MB: u64 = 512;
@@ -184,6 +199,7 @@ impl Default for MemoryConfig {
             prefault: false,
             zones: None,
             thp: true,
+            dirty_log: false,
         }
     }
 }
@@ -376,6 +392,7 @@ pub struct BalloonConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FsConfig {
     pub tag: String,
+    #[serde(default)]
     pub socket: PathBuf,
     #[serde(default = "default_fsconfig_num_queues")]
     pub num_queues: usize,
@@ -385,6 +402,10 @@ pub struct FsConfig {
     pub id: Option<String>,
     #[serde(default)]
     pub pci_segment: u16,
+    #[serde(default)]
+    pub backendfs_config: Option<BackendFsConfig>,
+    #[serde(default)]
+    pub rate_limiter_config: Option<RateLimiterConfig>,
 }
 
 pub fn default_fsconfig_num_queues() -> usize {
@@ -404,6 +425,8 @@ impl Default for FsConfig {
             queue_size: default_fsconfig_queue_size(),
             id: None,
             pci_segment: 0,
+            backendfs_config: None,
+            rate_limiter_config: None,
         }
     }
 }
@@ -439,10 +462,18 @@ pub struct ConsoleConfig {
     pub mode: ConsoleOutputMode,
     #[serde(default)]
     pub iommu: bool,
+    #[serde(default)]
+    pub sigwinch: bool,
 }
 
 pub fn default_consoleconfig_file() -> Option<PathBuf> {
     None
+}
+
+impl Default for ConsoleConfig {
+    fn default() -> Self {
+        default_console()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -492,6 +523,25 @@ pub struct VsockConfig {
     pub id: Option<String>,
     #[serde(default)]
     pub pci_segment: u16,
+    #[serde(default)]
+    pub muxer_epoll_nested: bool,
+}
+
+pub const DEFAULT_IVSHMEM_SIZE: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IvshmemConfig {
+    pub path: PathBuf,
+    pub size: usize,
+}
+
+impl Default for IvshmemConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            size: DEFAULT_IVSHMEM_SIZE << 20,
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -544,6 +594,7 @@ pub fn default_serial() -> ConsoleConfig {
         file: None,
         mode: ConsoleOutputMode::Null,
         iommu: false,
+        sigwinch: false,
     }
 }
 
@@ -552,6 +603,7 @@ pub fn default_console() -> ConsoleConfig {
         file: None,
         mode: ConsoleOutputMode::Tty,
         iommu: false,
+        sigwinch: false,
     }
 }
 
@@ -560,7 +612,7 @@ pub struct TpmConfig {
     pub socket: PathBuf,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VmConfig {
     #[serde(default)]
     pub cpus: CpusConfig,
@@ -583,6 +635,8 @@ pub struct VmConfig {
     pub vdpa: Option<Vec<VdpaConfig>>,
     pub vsock: Option<VsockConfig>,
     #[serde(default)]
+    pub pvpanic: bool,
+    #[serde(default)]
     pub iommu: bool,
     #[cfg(target_arch = "x86_64")]
     pub sgx_epc: Option<Vec<SgxEpcConfig>>,
@@ -593,4 +647,7 @@ pub struct VmConfig {
     pub gdb: bool,
     pub platform: Option<PlatformConfig>,
     pub tpm: Option<TpmConfig>,
+    #[serde(default)]
+    pub sys_ctrl: bool,
+    pub ivshmem: Option<IvshmemConfig>,
 }

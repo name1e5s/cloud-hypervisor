@@ -109,6 +109,40 @@ paths:
         405:
           description: The VM instance could not resume because it is not paused.
 
+  /vm.pause2snapshot:
+    put:
+      summary: Pause VM and returns a VM snapshot.
+      requestBody:
+        description: The snapshot configuration
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VmSnapshotConfig"
+        required: true
+      responses:
+        204:
+          description: The VM instance was successfully paused and snapshotted.
+        404:
+          description: The VM instance could not be paused and snapshotted because it is not created.
+        405:
+          description: The VM instance could not be paused and snapshotted because it is not booted.
+
+  /vm.resume-from-snapshot:
+    put:
+      summary: Resume a VM from a snapshot.
+      requestBody:
+        description: The restore configuration
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreConfig"
+        required: true
+      responses:
+        204:
+          description: The VM instance was successfully restored and resumed.
+        404:
+          description: The VM instance could not be restored because it is already created.
+
   /vm.shutdown:
     put:
       summary: Shut the VM instance down.
@@ -731,6 +765,9 @@ components:
         thp:
           type: boolean
           default: true
+        dirty_log:
+          type: boolean
+          default: false
         zones:
           type: array
           items:
@@ -1117,6 +1154,23 @@ components:
           type: string
         prefault:
           type: boolean
+        disks:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiskConfig"
+        net:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetConfig"
+        fs:
+          type: array
+          items:
+            $ref: "#/components/schemas/FsConfig"
+        vsock:
+          $ref: "#/components/schemas/VsockConfig"
+        dirty_log:
+          type: boolean
+          default: false
 
     ReceiveMigrationData:
       required:

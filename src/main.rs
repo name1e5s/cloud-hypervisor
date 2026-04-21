@@ -3,27 +3,46 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+mod common;
 #[macro_use(crate_authors)]
 extern crate clap;
-#[macro_use]
-extern crate event_monitor;
+extern crate log_json;
 
-use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
-use libc::EFD_NONBLOCK;
-use log::LevelFilter;
-use option_parser::OptionParser;
-use seccompiler::SeccompAction;
-use signal_hook::consts::SIGSYS;
 use std::env;
 use std::fs::File;
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::sync::mpsc::channel;
+use std::io::Write;
+use std::os::fd::RawFd;
+use std::os::unix::io::FromRawFd;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+
+use crate::common::{default_coredump_filter, default_coredump_limit, DEFAULT_LOGGER_BUFFER_SIZE};
+use chrono::{DateTime, Local};
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
+use event_monitor::event;
+use libc::{EFD_NONBLOCK, SIGSYS};
+use log::{error, info, LevelFilter};
+use logging::START_TM;
+use option_parser::OptionParser;
+use rlimit::{setrlimit, Resource};
+use seccompiler::SeccompAction;
+use std::sync::mpsc::channel;
 use thiserror::Error;
-use vmm::config;
+use vmm::api::service::{Error as VmmServiceError, VMM_SERVICE};
+use vmm::config::{RestoreConfig, VmParams};
+#[cfg(target_arch = "x86_64")]
+use vmm::vm_config::SgxEpcConfig;
+use vmm::vm_config::{
+    BalloonConfig, DeviceConfig, DiskConfig, FsConfig, IvshmemConfig, NetConfig, NumaConfig,
+    PmemConfig, TpmConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    DEFAULT_MAX_PHYS_BITS, DEFAULT_MEMORY_MB, DEFAULT_RNG_SOURCE, DEFAULT_VCPUS,
+};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::block_signal;
 use vmm_sys_util::terminal::Terminal;
+
+extern crate slog;
+extern crate slog_scope;
 
 #[derive(Error, Debug)]
 enum Error {
@@ -68,64 +87,22 @@ enum Error {
     LogFileCreation(std::io::Error),
     #[error("Error setting up logger: {0}")]
     LoggerSetup(log::SetLoggerError),
-}
-
-struct Logger {
-    output: Mutex<Box<dyn std::io::Write + Send>>,
-    start: std::time::Instant,
-}
-
-impl log::Log for Logger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
-    }
-
-    fn log(&self, record: &log::Record) {
-        if !self.enabled(record.metadata()) {
-            return;
-        }
-
-        let now = std::time::Instant::now();
-        let duration = now.duration_since(self.start);
-
-        if record.file().is_some() && record.line().is_some() {
-            writeln!(
-                *(*(self.output.lock().unwrap())),
-                "cloud-hypervisor: {:?}: <{}> {}:{}:{} -- {}",
-                duration,
-                std::thread::current().name().unwrap_or("anonymous"),
-                record.level(),
-                record.file().unwrap(),
-                record.line().unwrap(),
-                record.args()
-            )
-        } else {
-            writeln!(
-                *(*(self.output.lock().unwrap())),
-                "cloud-hypervisor: {:?}: <{}> {}:{} -- {}",
-                duration,
-                std::thread::current().name().unwrap_or("anonymous"),
-                record.level(),
-                record.target(),
-                record.args()
-            )
-        }
-        .ok();
-    }
-    fn flush(&self) {}
+    #[error("Error setting up coredump: {0}")]
+    CoredumpSetup(std::io::Error),
+    #[error("Error init vmm service: {0}")]
+    InitVmmService(VmmServiceError),
 }
 
 fn prepare_default_values() -> (String, String, String) {
-    let default_vcpus =
-        format! {"boot={},max_phys_bits={}", config::DEFAULT_VCPUS,config::DEFAULT_MAX_PHYS_BITS};
-    let default_memory = format! {"size={}M", config::DEFAULT_MEMORY_MB};
-    let default_rng = format! {"src={}", config::DEFAULT_RNG_SOURCE};
+    let default_vcpus = format! {"boot={},max_phys_bits={}", DEFAULT_VCPUS,DEFAULT_MAX_PHYS_BITS};
+    let default_memory = format! {"size={}M", DEFAULT_MEMORY_MB};
+    let default_rng = format! {"src={}", DEFAULT_RNG_SOURCE};
 
     (default_vcpus, default_memory, default_rng)
 }
 
 fn create_app(default_vcpus: String, default_memory: String, default_rng: String) -> Command {
-    let app = Command::new("cloud-hypervisor")
+    let app = Command::new("cube-hypervisor")
         // 'BUILT_VERSION' is set by the build script 'build.rs' at
         // compile time
         .version(env!("BUILT_VERSION"))
@@ -142,7 +119,7 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
                     topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>,\
                     kvm_hyperv=on|off,max_phys_bits=<maximum_number_of_physical_bits>,\
                     affinity=<list_of_vcpus_with_their_associated_cpuset>,\
-                    features=<list_of_features_to_enable>",
+                    features=<list_of_features_to_enable>,compatible=vendor|max|ignore",
                 )
                 .default_value(default_vcpus)
                 .group("vm-config"),
@@ -221,14 +198,14 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
         .arg(
             Arg::new("disk")
                 .long("disk")
-                .help(config::DiskConfig::SYNTAX)
+                .help(DiskConfig::SYNTAX)
                 .num_args(1..)
                 .group("vm-config"),
         )
         .arg(
             Arg::new("net")
                 .long("net")
-                .help(config::NetConfig::SYNTAX)
+                .help(NetConfig::SYNTAX)
                 .num_args(1..)
                 .group("vm-config"),
         )
@@ -244,21 +221,21 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
         .arg(
             Arg::new("balloon")
                 .long("balloon")
-                .help(config::BalloonConfig::SYNTAX)
+                .help(BalloonConfig::SYNTAX)
                 .num_args(1)
                 .group("vm-config"),
         )
         .arg(
             Arg::new("fs")
                 .long("fs")
-                .help(config::FsConfig::SYNTAX)
+                .help(FsConfig::SYNTAX)
                 .num_args(1..)
                 .group("vm-config"),
         )
         .arg(
             Arg::new("pmem")
                 .long("pmem")
-                .help(config::PmemConfig::SYNTAX)
+                .help(PmemConfig::SYNTAX)
                 .num_args(1..)
                 .group("vm-config"),
         )
@@ -281,35 +258,35 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
         .arg(
             Arg::new("device")
                 .long("device")
-                .help(config::DeviceConfig::SYNTAX)
+                .help(DeviceConfig::SYNTAX)
                 .num_args(1..)
                 .group("vm-config"),
         )
         .arg(
             Arg::new("user-device")
                 .long("user-device")
-                .help(config::UserDeviceConfig::SYNTAX)
+                .help(UserDeviceConfig::SYNTAX)
                 .num_args(1..)
                 .group("vm-config"),
         )
         .arg(
             Arg::new("vdpa")
                 .long("vdpa")
-                .help(config::VdpaConfig::SYNTAX)
+                .help(VdpaConfig::SYNTAX)
                 .num_args(1..)
                 .group("vm-config"),
         )
         .arg(
             Arg::new("vsock")
                 .long("vsock")
-                .help(config::VsockConfig::SYNTAX)
+                .help(VsockConfig::SYNTAX)
                 .num_args(1)
                 .group("vm-config"),
         )
         .arg(
             Arg::new("numa")
                 .long("numa")
-                .help(config::NumaConfig::SYNTAX)
+                .help(NumaConfig::SYNTAX)
                 .num_args(1..)
                 .group("vm-config"),
         )
@@ -336,6 +313,29 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
                 .group("logging"),
         )
         .arg(
+            Arg::new("sandbox-id")
+                .long("sandbox-id")
+                .help("Ssandbox ID, will show in logs")
+                .num_args(1)
+                .group("logging"),
+        )
+        .arg(
+            Arg::new("log-stderr")
+                .long("log-stderr")
+                .help("Logging to stderr, disable log-file.")
+                .num_args(0)
+                .action(ArgAction::SetTrue)
+                .group("logging"),
+        )
+        .arg(
+            Arg::new("sys-ctrl")
+                .long("sys-ctrl")
+                .help("Enable system controller")
+                .num_args(0)
+                .action(ArgAction::SetTrue)
+                .group("vm-config"),
+        )
+        .arg(
             Arg::new("api-socket")
                 .long("api-socket")
                 .help("HTTP API socket (UNIX domain socket): path=</path/to/a/file> or fd=<fd>.")
@@ -352,7 +352,7 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
         .arg(
             Arg::new("restore")
                 .long("restore")
-                .help(config::RestoreConfig::SYNTAX)
+                .help(RestoreConfig::SYNTAX)
                 .num_args(1)
                 .group("vmm-config"),
         )
@@ -360,23 +360,45 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
             Arg::new("seccomp")
                 .long("seccomp")
                 .num_args(1)
-                .value_parser(["true", "false", "log"])
-                .default_value("true"),
+                .value_parser(["true", "false", "log", "process"])
+                .default_value("process"),
         )
         .arg(
             Arg::new("tpm")
                 .long("tpm")
                 .num_args(1)
-                .help(config::TpmConfig::SYNTAX)
-                .group("vmm-config"),
+                .help(TpmConfig::SYNTAX)
+                .group("vm-config"),
 
+        )
+        .arg(
+            Arg::new("coredump")
+                .long("coredump")
+                .help("filter=<filter>,limit=<limit>")
+                .num_args(1..)
+                .group("vmm-config"),
+        )
+        .arg(
+            Arg::new("pvpanic")
+                .long("pvpanic")
+                .help("Enable pvpanic-pci")
+                .num_args(0)
+                .action(ArgAction::SetTrue)
+                .group("vm-config"),
+        )
+        .arg(
+            Arg::new("ivshmem")
+                .long("ivshmem")
+                .help(IvshmemConfig::SYNTAX)
+                .num_args(1..)
+                .group("vm-config"),
         );
 
     #[cfg(target_arch = "x86_64")]
     let app = app.arg(
         Arg::new("sgx-epc")
             .long("sgx-epc")
-            .help(config::SgxEpcConfig::SYNTAX)
+            .help(SgxEpcConfig::SYNTAX)
             .num_args(1..)
             .group("vm-config"),
     );
@@ -390,10 +412,38 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
             .group("vmm-config"),
     );
 
+    let app = app.arg(
+        Arg::new("snapshot-version")
+            .short('D')
+            .long("snapshot-version")
+            .exclusive(true)
+            .action(clap::ArgAction::SetTrue)
+            .help("snapshot version, restore from different snapshot version is not supported"),
+    );
+
     app
 }
 
-fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
+fn start_vmm(
+    cmd_arguments: ArgMatches,
+    now: std::time::Instant,
+    local: DateTime<Local>,
+) -> Result<Option<String>, Error> {
+    let tm1 = std::time::Instant::now().duration_since(now);
+
+    // Create dummy socket and dup it to large fd, so that we could trigger
+    // expand_files in kernel. And this tricky work will avoid later multi
+    // thread try to invoke expand_files at same time, there will be lock
+    // contention in expand_files.
+    // SAFETY: FFI call
+    unsafe {
+        let dummy = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if dummy > 0 {
+            libc::dup2(dummy, 512);
+        }
+    }
+
+    let mut defer_logger_thread: bool = true;
     let log_level = match cmd_arguments.get_count("v") {
         0 => LevelFilter::Warn,
         1 => LevelFilter::Info,
@@ -401,20 +451,118 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
         _ => LevelFilter::Trace,
     };
 
-    let log_file: Box<dyn std::io::Write + Send> = if let Some(file) =
-        cmd_arguments.get_one::<String>("log-file")
-    {
-        Box::new(std::fs::File::create(std::path::Path::new(file)).map_err(Error::LogFileCreation)?)
+    if log_level > LevelFilter::Info {
+        defer_logger_thread = false;
+    }
+
+    // Init log file name.
+    let log_file_name = if let Some(file) = cmd_arguments.get_one::<String>("log-file") {
+        file.clone()
     } else {
-        Box::new(std::io::stderr())
+        String::from(crate::common::DEFAULT_LOG_FILE)
     };
 
-    log::set_boxed_logger(Box::new(Logger {
-        output: Mutex::new(log_file),
-        start: std::time::Instant::now(),
-    }))
+    // Init log file and log async mode.
+    let (log_file, log_async) = {
+        if !cmd_arguments.get_flag("log-stderr") {
+            // Create directories. We need this when we add new machine in
+            // Cube environment.
+            let dir = std::path::Path::new(&log_file_name).parent().unwrap();
+            std::fs::create_dir_all(dir).map_err(Error::LogFileCreation)?;
+
+            // Open async log file later in cube-log
+            // thread. Let cube-log thread handle the
+            // log file rotate(reopen) logic.
+            (None, true)
+        } else {
+            let file: Box<dyn std::io::Write + Send> = Box::new(std::io::stderr());
+            (Some(file), false)
+        }
+    };
+
+    let sandbox_id: String = if let Some(sandboxid) = cmd_arguments.get_one::<String>("sandbox-id")
+    {
+        sandboxid.to_string()
+    } else {
+        String::from("cube-hypervisor")
+    };
+
+    #[cfg(feature = "logger_debug")]
+    let mut logger_dbg_file_name = log_file_name.clone();
+    #[cfg(feature = "logger_debug")]
+    logger_dbg_file_name.push_str(".dbg");
+    #[cfg(feature = "logger_debug")]
+    let logger_dbg_file = Arc::new(Mutex::new(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(logger_dbg_file_name)
+            .unwrap(),
+    ));
+
+    let wait_vcpu_started = Arc::new(AtomicBool::new(false));
+    *START_TM.lock().unwrap() = now;
+
+    log::set_boxed_logger(Box::new(crate::common::Logger::new(
+        Mutex::new(log_file),
+        now,
+        sandbox_id.clone(),
+        log_async,
+        defer_logger_thread,
+        Arc::new(Mutex::new(Vec::with_capacity(DEFAULT_LOGGER_BUFFER_SIZE))),
+        Arc::new(Mutex::new(AtomicBool::new(false))),
+        log_file_name,
+        wait_vcpu_started.clone(),
+        Arc::new(AtomicBool::new(false)),
+        #[cfg(feature = "logger_debug")]
+        logger_dbg_file,
+    )))
     .map(|()| log::set_max_level(log_level))
     .map_err(Error::LoggerSetup)?;
+
+    #[cfg(not(feature = "lib_support"))]
+    std::panic::set_hook(Box::new(|info| {
+        info!("{info:?}");
+        log::logger().flush();
+    }));
+
+    let tm2 = std::time::Instant::now().duration_since(now);
+
+    info!(
+            "Cube-Hypervisor version {} started with PID: {}, prepare main {}ms, prepare vmm {}ms, start {}",
+            env!("BUILT_VERSION"),
+            std::process::id(),
+            tm1.as_millis(),
+            tm2.as_millis(),
+            local
+    );
+
+    let mut coredump_limit = default_coredump_limit();
+    let mut coredump_filter = default_coredump_filter();
+    if let Some(coredump_config) = cmd_arguments.get_one::<String>("coredump") {
+        let mut parser = OptionParser::new();
+
+        parser.add("filter").add("limit");
+        parser.parse(coredump_config).unwrap_or_default();
+
+        if let Some(filter) = parser.get("filter") {
+            coredump_filter = filter;
+        }
+
+        if let Some(limit) = parser.get("limit") {
+            coredump_limit = limit.parse::<u64>().unwrap();
+        }
+    }
+
+    let mut filter_file = File::options()
+        .write(true)
+        .open("/proc/self/coredump_filter")
+        .map_err(Error::CoredumpSetup)?;
+    filter_file
+        .write(coredump_filter.as_bytes())
+        .map_err(Error::CoredumpSetup)?;
+    setrlimit(Resource::CORE, coredump_limit, coredump_limit).map_err(Error::CoredumpSetup)?;
 
     let (api_socket_path, api_socket_fd) =
         if let Some(socket_config) = cmd_arguments.get_one::<String>("api-socket") {
@@ -467,37 +615,45 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     }
 
     let (api_request_sender, api_request_receiver) = channel();
+    let (res_sender, res_receiver) = channel();
     let api_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateApiEventFd)?;
 
-    let http_sender = api_request_sender.clone();
+    VMM_SERVICE
+        .lock()
+        .unwrap()
+        .init(
+            api_request_sender,
+            api_evt.try_clone().unwrap(),
+            res_receiver,
+        )
+        .map_err(Error::InitVmmService)?;
+
     let seccomp_action = if let Some(seccomp_value) = cmd_arguments.get_one::<String>("seccomp") {
         match seccomp_value as &str {
             "true" => SeccompAction::Trap,
             "false" => SeccompAction::Allow,
             "log" => SeccompAction::Log,
+            "process" => SeccompAction::KillProcess,
             _ => {
                 // The user providing an invalid value will be rejected by clap
                 panic!("Invalid parameter {} for \"--seccomp\" flag", seccomp_value);
             }
         }
     } else {
-        SeccompAction::Trap
+        SeccompAction::KillProcess
     };
 
-    if seccomp_action == SeccompAction::Trap {
+    if seccomp_action == SeccompAction::Trap || seccomp_action == SeccompAction::KillProcess {
         // SAFETY: We only using signal_hook for managing signals and only execute signal
         // handler safe functions (writing to stderr) and manipulating signals.
         unsafe {
-            signal_hook::low_level::register(signal_hook::consts::SIGSYS, || {
-                eprint!(
-                    "\n==== Possible seccomp violation ====\n\
-                Try running with `strace -ff` to identify the cause and open an issue: \
-                https://github.com/cloud-hypervisor/cloud-hypervisor/issues/new\n"
-                );
+            signal_hook::low_level::register(SIGSYS, || {
+                eprint!("\nError signal: SIGSYS, possible seccomp violation.\n");
+                error!("Error signal: SIGSYS, possible seccomp violation.");
                 signal_hook::low_level::emulate_default_handler(SIGSYS).unwrap();
             })
         }
-        .map_err(|e| eprintln!("Error adding SIGSYS signal handler: {}", e))
+        .map_err(|e| error!("Error adding SIGSYS signal handler: {e}"))
         .ok();
     }
 
@@ -506,13 +662,13 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     // dedicated signal handling thread we'll start in a bit.
     for sig in &vmm::vm::Vm::HANDLED_SIGNALS {
         if let Err(e) = block_signal(*sig) {
-            eprintln!("Error blocking signals: {}", e);
+            error!("Error blocking signals: {e}");
         }
     }
 
     for sig in &vmm::Vmm::HANDLED_SIGNALS {
         if let Err(e) = block_signal(*sig) {
-            eprintln!("Error blocking signals: {}", e);
+            error!("Error blocking signals: {e}");
         }
     }
 
@@ -543,9 +699,9 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
         env!("CARGO_PKG_VERSION").to_string(),
         &api_socket_path,
         api_socket_fd,
-        api_evt.try_clone().unwrap(),
-        http_sender,
+        api_evt,
         api_request_receiver,
+        res_sender,
         #[cfg(feature = "guest_debug")]
         gdb_socket_path,
         #[cfg(feature = "guest_debug")]
@@ -554,6 +710,9 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
         vm_debug_evt.try_clone().unwrap(),
         &seccomp_action,
         hypervisor,
+        sandbox_id,
+        wait_vcpu_started,
+        None,
     )
     .map_err(Error::StartVmmThread)?;
 
@@ -561,24 +720,16 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
         cmd_arguments.contains_id("kernel") || cmd_arguments.contains_id("firmware");
 
     if payload_present {
-        let vm_params = config::VmParams::from_arg_matches(&cmd_arguments);
-        let vm_config = config::VmConfig::parse(vm_params).map_err(Error::ParsingConfig)?;
+        let vm_params = VmParams::from_arg_matches(&cmd_arguments);
+        let vm_config = VmConfig::parse(vm_params).map_err(Error::ParsingConfig)?;
 
         // Create and boot the VM based off the VM config we just built.
-        let sender = api_request_sender.clone();
-        vmm::api::vm_create(
-            api_evt.try_clone().unwrap(),
-            api_request_sender,
-            Arc::new(Mutex::new(vm_config)),
-        )
-        .map_err(Error::VmCreate)?;
-        vmm::api::vm_boot(api_evt.try_clone().unwrap(), sender).map_err(Error::VmBoot)?;
+        vmm::api::vm_create(Box::new(vm_config)).map_err(Error::VmCreate)?;
+        vmm::api::vm_boot().map_err(Error::VmBoot)?;
     } else if let Some(restore_params) = cmd_arguments.get_one::<String>("restore") {
-        vmm::api::vm_restore(
-            api_evt.try_clone().unwrap(),
-            api_request_sender,
-            Arc::new(config::RestoreConfig::parse(restore_params).map_err(Error::ParsingRestore)?),
-        )
+        vmm::api::vm_restore(Arc::new(
+            RestoreConfig::parse(restore_params).map_err(Error::ParsingRestore)?,
+        ))
         .map_err(Error::VmRestore)?;
     }
 
@@ -591,18 +742,25 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
 }
 
 fn main() {
+    let now = std::time::Instant::now();
+    let local = Local::now();
     // Ensure all created files (.e.g sockets) are only accessible by this user
     let _ = unsafe { libc::umask(0o077) };
 
     let (default_vcpus, default_memory, default_rng) = prepare_default_values();
     let cmd_arguments = create_app(default_vcpus, default_memory, default_rng).get_matches();
-    let exit_code = match start_vmm(cmd_arguments) {
+    if cmd_arguments.get_flag("snapshot-version") {
+        println!("Sanpshot Version: {}", vmm::api::SNAPSHOT_VERSION);
+        return;
+    }
+    let exit_code = match start_vmm(cmd_arguments, now, local) {
         Ok(path) => {
             path.map(|s| std::fs::remove_file(s).ok());
             0
         }
         Err(e) => {
             eprintln!("{}", e);
+            log::logger().flush();
             1
         }
     };
@@ -619,12 +777,12 @@ fn main() {
 
 #[cfg(test)]
 mod unit_tests {
-    use crate::config::HotplugMethod;
     use crate::{create_app, prepare_default_values};
     use std::path::PathBuf;
-    use vmm::config::{
-        ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig, MemoryConfig, PayloadConfig,
-        RngConfig, VmConfig, VmParams,
+    use vmm::config::VmParams;
+    use vmm::vm_config::{
+        CompatibleMode, ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig, HotplugMethod,
+        MemoryConfig, PayloadConfig, RngConfig, VmConfig,
     };
 
     fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
@@ -672,6 +830,7 @@ mod unit_tests {
                 max_phys_bits: 46,
                 affinity: None,
                 features: CpuFeatures::default(),
+                compatible: CompatibleMode::Ignore,
             },
             memory: MemoryConfig {
                 size: 536_870_912,
@@ -702,17 +861,20 @@ mod unit_tests {
             serial: ConsoleConfig {
                 file: None,
                 mode: ConsoleOutputMode::Null,
+                sigwinch: false,
                 iommu: false,
             },
             console: ConsoleConfig {
                 file: None,
                 mode: ConsoleOutputMode::Tty,
+                sigwinch: false,
                 iommu: false,
             },
             devices: None,
             user_devices: None,
             vdpa: None,
             vsock: None,
+            pvpanic: false,
             iommu: false,
             #[cfg(target_arch = "x86_64")]
             sgx_epc: None,
@@ -722,6 +884,8 @@ mod unit_tests {
             gdb: false,
             platform: None,
             tpm: None,
+            sys_ctrl: false,
+            ivshmem: None,
         };
 
         assert_eq!(expected_vm_config, result_vm_config);
