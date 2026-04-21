@@ -1,5 +1,5 @@
 [package]
-name = "event_monitor"
+name = "log_json"
 version = "0.1.0"
 authors = ["The Cloud Hypervisor Authors"]
 edition = "2021"
