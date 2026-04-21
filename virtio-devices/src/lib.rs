@@ -28,6 +28,7 @@ pub mod balloon;
 pub mod block;
 mod console;
 pub mod epoll_helper;
+pub mod fs;
 mod iommu;
 pub mod mem;
 pub mod net;
@@ -41,21 +42,30 @@ pub mod vhost_user;
 pub mod vsock;
 pub mod watchdog;
 
-pub use self::balloon::*;
-pub use self::block::*;
-pub use self::console::*;
-pub use self::device::*;
-pub use self::epoll_helper::*;
-pub use self::iommu::*;
-pub use self::mem::*;
-pub use self::net::*;
-pub use self::pmem::*;
-pub use self::rng::*;
-pub use self::vdpa::*;
-pub use self::vsock::*;
-pub use self::watchdog::*;
+pub use self::balloon::Balloon;
+pub use self::block::{Block, BlockState};
+pub use self::console::{Console, ConsoleResizer, Endpoint};
+pub use self::device::{
+    DmaRemapping, UserspaceMapping, VirtioCommon, VirtioDevice, VirtioInterrupt,
+    VirtioInterruptType, VirtioSharedMemoryList,
+};
+pub use self::epoll_helper::{
+    EpollHelper, EpollHelperError, EpollHelperHandler, EPOLL_HELPER_EVENT_LAST,
+};
+pub use self::fs::*;
+pub use self::iommu::{AccessPlatformMapping, Iommu, IommuMapping};
+pub use self::mem::{BlocksState, Mem, VirtioMemMappingSource, VIRTIO_MEM_ALIGN_SIZE};
+pub use self::net::{Net, NetCtrlEpollHandler};
+pub use self::pmem::Pmem;
+pub use self::rng::Rng;
+pub use self::vdpa::{Vdpa, VdpaDmaMapping};
+pub use self::vsock::Vsock;
+pub use self::watchdog::Watchdog;
+
 use vm_memory::{bitmap::AtomicBitmap, GuestAddress, GuestMemory};
 use vm_virtio::VirtioDeviceType;
+
+use virtiofsd::Error as VirtioFsError;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
@@ -96,6 +106,12 @@ pub enum ActivateError {
     CreateRateLimiter(std::io::Error),
     #[error("Failed to activate the vDPA device: {0}")]
     ActivateVdpa(vdpa::Error),
+    #[error("Failed to activate the virtio-fs device: {0}")]
+    ActivateVirtioFs(std::io::Error),
+    #[error("Failed to create virtiofs server: {0}")]
+    InvalidServerConfig(VirtioFsError),
+    #[error("Failed to restore virtiofs state: {0}")]
+    InvalidVirtioFsState(std::io::Error),
 }
 
 pub type ActivateResult = std::result::Result<(), ActivateError>;

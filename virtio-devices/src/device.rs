@@ -309,7 +309,7 @@ impl VirtioCommon {
 
 impl Pausable for VirtioCommon {
     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
-        info!(
+        debug!(
             "Pausing virtio-{}",
             VirtioDeviceType::from(self.device_type)
         );
@@ -331,7 +331,7 @@ impl Pausable for VirtioCommon {
     }
 
     fn resume(&mut self) -> std::result::Result<(), MigratableError> {
-        info!(
+        debug!(
             "Resuming virtio-{}",
             VirtioDeviceType::from(self.device_type)
         );

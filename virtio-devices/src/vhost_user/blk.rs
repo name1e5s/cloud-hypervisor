@@ -11,18 +11,17 @@ use crate::{GuestMemoryMmap, GuestRegionMmap};
 use crate::{VirtioInterrupt, VIRTIO_F_IOMMU_PLATFORM};
 use block_util::VirtioBlockConfig;
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use std::mem;
 use std::result;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::vec::Vec;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use vhost::vhost_user::message::{
     VhostUserConfigFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
     VHOST_USER_CONFIG_OFFSET,
 };
-use vhost::vhost_user::{MasterReqHandler, VhostUserMaster, VhostUserMasterReqHandler};
+use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler};
 use virtio_bindings::bindings::virtio_blk::{
     VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_CONFIG_WCE, VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_FLUSH,
     VIRTIO_BLK_F_GEOMETRY, VIRTIO_BLK_F_MQ, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SEG_MAX,
@@ -32,13 +31,13 @@ use virtio_queue::Queue;
 use vm_memory::{ByteValued, GuestMemoryAtomic};
 use vm_migration::{
     protocol::MemoryRangeTable, Migratable, MigratableError, Pausable, Snapshot, Snapshottable,
-    Transportable, VersionMapped,
+    Transportable,
 };
 use vmm_sys_util::eventfd::EventFd;
 
 const DEFAULT_QUEUE_NUMBER: usize = 1;
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 pub struct State {
     pub avail_features: u64,
     pub acked_features: u64,
@@ -47,10 +46,8 @@ pub struct State {
     pub vu_num_queues: usize,
 }
 
-impl VersionMapped for State {}
-
-struct SlaveReqHandler {}
-impl VhostUserMasterReqHandler for SlaveReqHandler {}
+struct BackendReqHandler {}
+impl VhostUserFrontendReqHandler for BackendReqHandler {}
 
 pub struct Blk {
     common: VirtioCommon,
@@ -280,7 +277,7 @@ impl VirtioDevice for Blk {
         self.common.activate(&queues, &interrupt_cb)?;
         self.guest_memory = Some(mem.clone());
 
-        let slave_req_handler: Option<MasterReqHandler<SlaveReqHandler>> = None;
+        let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
 
         // Run a dedicated thread for handling potential reconnections with
         // the backend.
@@ -291,7 +288,7 @@ impl VirtioDevice for Blk {
             queues,
             interrupt_cb,
             self.common.acked_features,
-            slave_req_handler,
+            backend_req_handler,
             kill_evt,
             pause_evt,
         )?;
