@@ -200,6 +200,12 @@ export RUST_BACKTRACE=1
 time cargo test $features "common_parallel::$test_filter" -- ${test_binary_args[*]}
 RES=$?
 
+if [ $RES -eq 0 ]; then
+    export RUST_BACKTRACE=1
+    time cargo test $features "vmm_instance::$test_filter" --features lib_support -- --test-threads=1 ${test_binary_args[*]}
+    RES=$?
+fi
+
 # Run some tests in sequence since the result could be affected by other tests
 # running in parallel.
 if [ $RES -eq 0 ]; then
