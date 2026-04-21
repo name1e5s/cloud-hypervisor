@@ -10,7 +10,7 @@
 
 use crate::arch::x86::{
     CpuIdEntry, DescriptorTable, FpuState, LapicState, MsrEntry, SegmentRegister, SpecialRegisters,
-    StandardRegisters, CPUID_FLAG_VALID_INDEX,
+    StandardRegisters, XsaveState, CPUID_FLAG_VALID_INDEX,
 };
 use crate::kvm::{Cap, Kvm, KvmError, KvmResult};
 use serde::{Deserialize, Serialize};
@@ -61,7 +61,7 @@ pub struct VcpuKvmState {
     pub sregs: kvm_sregs,
     pub fpu: FpuState,
     pub lapic_state: LapicState,
-    pub xsave: Xsave,
+    pub xsave: XsaveState,
     pub xcrs: ExtendedControlRegisters,
     pub mp_state: MpState,
 }
@@ -323,6 +323,21 @@ impl From<MsrEntry> for kvm_msr_entry {
             index: e.index,
             data: e.data,
             ..Default::default()
+        }
+    }
+}
+
+impl From<Xsave> for XsaveState {
+    fn from(s: Xsave) -> Self {
+        Self { region: s.region }
+    }
+}
+
+impl From<XsaveState> for Xsave {
+    fn from(s: XsaveState) -> Self {
+        Self {
+            region: s.region,
+            extra: Default::default(),
         }
     }
 }
