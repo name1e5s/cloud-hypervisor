@@ -2,6 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use super::super::csm::ConnState;
+use super::super::defs::uapi;
+use super::super::device::MUXER_EPOLL_EVENT;
+use super::super::packet::VsockPacket;
+use super::super::{
+    Result as VsockResult, VsockBackend, VsockChannel, VsockEpollListener, VsockError,
+};
+use super::defs;
+use super::muxer_killq::MuxerKillQ;
+use super::muxer_rxq::MuxerRxQ;
+use super::MuxerConnection;
+use super::{Error, Result};
+use crate::vsock::packet::VirtioVsockHdr;
 /// `VsockMuxer` is the device-facing component of the Unix domain sockets vsock backend. I.e.
 /// by implementing the `VsockBackend` trait, it abstracts away the gory details of translating
 /// between AF_VSOCK and AF_UNIX, and presents a clean interface to the rest of the vsock
@@ -31,23 +44,13 @@
 ///    To route all these events to their handlers, the muxer uses another `HashMap` object,
 ///    mapping `RawFd`s to `EpollListener`s.
 ///
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-
-use super::super::csm::ConnState;
-use super::super::defs::uapi;
-use super::super::packet::VsockPacket;
-use super::super::{
-    Result as VsockResult, VsockBackend, VsockChannel, VsockEpollListener, VsockError,
-};
-use super::defs;
-use super::muxer_killq::MuxerKillQ;
-use super::muxer_rxq::MuxerRxQ;
-use super::MuxerConnection;
-use super::{Error, Result};
+use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
 
 /// A unique identifier of a `MuxerConnection` object. Connections are stored in a hash map,
 /// keyed by a `ConnMapKey` object.
@@ -85,9 +88,18 @@ enum EpollListener {
     LocalStream(UnixStream),
 }
 
+pub struct ConnectionInfo {
+    /// timestamp accept host vsock app unix socket
+    pub unix_accept_time: std::time::Instant,
+    /// timestamp host vsock app send CONNECT
+    pub send_connect_time: std::time::Instant,
+}
+
 /// The vsock connection multiplexer.
 ///
 pub struct VsockMuxer {
+    /// The Vsock Muxer ID
+    id: String,
     /// Guest CID.
     cid: u64,
     /// A hash map used to store the active connections.
@@ -115,6 +127,18 @@ pub struct VsockMuxer {
     local_port_set: HashSet<u32>,
     /// The last used host-side port.
     local_port_last: u32,
+    /// epoll helper fd
+    helper_fd: RawFd,
+    epoll_nested: bool,
+    /// cube dbg vsock conf
+    cube_dbg_conf: Vec<CubeVsockDbgConf>,
+    /// vsock host app connection info
+    conn_info: HashMap<RawFd, ConnectionInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct VsockMuxerState {
+    local_port_set: HashSet<u32>,
 }
 
 impl VsockChannel for VsockMuxer {
@@ -182,7 +206,10 @@ impl VsockChannel for VsockMuxer {
                     });
                 }
 
-                debug!("vsock muxer: RX pkt: {:?}", pkt.hdr());
+                debug!(
+                    "vsock muxer: RX pkt: {:?}",
+                    VirtioVsockHdr::from_slice(pkt.hdr())
+                );
                 return Ok(());
             }
         }
@@ -208,7 +235,7 @@ impl VsockChannel for VsockMuxer {
         debug!(
             "vsock: muxer.send[rxq.len={}]: {:?}",
             self.rxq.len(),
-            pkt.hdr()
+            VirtioVsockHdr::from_slice(pkt.hdr())
         );
 
         // If this packet has an unsupported type (!=stream), we must send back an RST.
@@ -223,7 +250,7 @@ impl VsockChannel for VsockMuxer {
         if pkt.dst_cid() != uapi::VSOCK_HOST_CID {
             info!(
                 "vsock: dropping guest packet for unknown CID: {:?}",
-                pkt.hdr()
+                VirtioVsockHdr::from_slice(pkt.hdr())
             );
             return Ok(());
         }
@@ -277,6 +304,10 @@ impl VsockEpollListener for VsockMuxer {
         self.epoll_file.as_raw_fd()
     }
 
+    fn muxer_epoll_nested(&self) -> bool {
+        self.epoll_nested
+    }
+
     /// Get the epoll events to be polled upstream.
     ///
     /// Since the polled FD is a nested epoll FD, we're only interested in EPOLLIN events (i.e.
@@ -322,14 +353,72 @@ impl VsockEpollListener for VsockMuxer {
             break 'epoll;
         }
     }
+    fn set_epoll_helper_fd(&mut self, epfd: RawFd) {
+        self.helper_fd = epfd;
+    }
+
+    fn add_host_sock(&mut self) {
+        self.add_host_sock_to_listener();
+    }
+
+    fn dispatch_muxer_event(&mut self, fd: RawFd, event_set: epoll::Events) {
+        self.handle_host_sock_event(fd, event_set);
+    }
+}
+
+impl Pausable for VsockMuxer {}
+
+impl Snapshottable for VsockMuxer {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+    fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+        Snapshot::new_from_state(&self.id, &self.state())
+    }
 }
 
 impl VsockBackend for VsockMuxer {}
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct CubeVsockDbgConf {
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub port: u32,
+}
+
+pub fn cube_get_vsock_dbg_conf() -> Vec<CubeVsockDbgConf> {
+    let file = "/etc/cube-hypervisor/vsock_conf.json";
+    if let Ok(_) = std::fs::metadata(&file) {
+        debug!("vsock dbg json_path {:?}", file);
+        if let Ok(conf) = serde_json::from_str(&std::fs::read_to_string(file).unwrap()) {
+            return conf;
+        } else {
+            Vec::new()
+        }
+    } else {
+        debug!("vsock no dbg conf file");
+        Vec::new()
+    }
+}
+
 impl VsockMuxer {
     /// Muxer constructor.
     ///
-    pub fn new(cid: u64, host_sock_path: String) -> Result<Self> {
+    pub fn new(
+        id: String,
+        cid: u64,
+        host_sock_path: String,
+        epoll_nested: bool,
+        state: Option<VsockMuxerState>,
+    ) -> Result<Self> {
+        // Create the local port set.
+        let local_port_set = if let Some(state) = state {
+            state.local_port_set
+        } else {
+            HashSet::with_capacity(defs::MAX_CONNECTIONS)
+        };
+
         // Create the nested epoll FD. This FD will be added to the VMM `EpollContext`, at
         // device activation time.
         let epoll_fd = epoll::create(true).map_err(Error::EpollFdCreate)?;
@@ -342,7 +431,11 @@ impl VsockMuxer {
             .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
             .map_err(Error::UnixBind)?;
 
+        let cube_dbg_conf = cube_get_vsock_dbg_conf();
+        debug!("vsock: cube dbg conf {:?}", cube_dbg_conf);
+
         let mut muxer = Self {
+            id,
             cid,
             host_sock,
             host_sock_path,
@@ -352,11 +445,132 @@ impl VsockMuxer {
             listener_map: HashMap::with_capacity(defs::MAX_CONNECTIONS + 1),
             killq: MuxerKillQ::new(),
             local_port_last: (1u32 << 30) - 1,
-            local_port_set: HashSet::with_capacity(defs::MAX_CONNECTIONS),
+            local_port_set,
+            helper_fd: epoll_fd,
+            epoll_nested,
+            cube_dbg_conf,
+            conn_info: HashMap::with_capacity(defs::MAX_CONNECTIONS),
         };
 
-        muxer.add_listener(muxer.host_sock.as_raw_fd(), EpollListener::HostSock)?;
+        if epoll_nested {
+            muxer.add_listener(muxer.host_sock.as_raw_fd(), EpollListener::HostSock)?;
+        }
         Ok(muxer)
+    }
+
+    fn add_host_sock_to_listener(&mut self) {
+        let _ = self.add_listener(self.host_sock.as_raw_fd(), EpollListener::HostSock);
+    }
+
+    fn is_cube_vsock_dbg_port(&self, port: u32) -> Option<String> {
+        for conf in self.cube_dbg_conf.iter() {
+            if port == conf.port {
+                return Some(conf.file.clone());
+            }
+        }
+        None
+    }
+
+    /// Handle host sock event.
+    fn handle_host_sock_event(&mut self, fd: RawFd, event_set: epoll::Events) {
+        debug!(
+            "vsock: muxer processing host sock event: fd={}, event_set={:?}",
+            fd, event_set
+        );
+
+        match self.listener_map.get_mut(&fd) {
+            // This event needs to be forwarded to a `MuxerConnection` that is listening for
+            // it.
+            //
+            Some(EpollListener::Connection { key, evset: _ }) => {
+                let key_copy = *key;
+                // The handling of this event will most probably mutate the state of the
+                // receiving connection. We'll need to check for new pending RX, event set
+                // mutation, and all that, so we're wrapping the event delivery inside those
+                // checks.
+                self.apply_conn_mutation(key_copy, |conn| {
+                    conn.notify(event_set);
+                });
+            }
+
+            // A new host-initiated connection is ready to be accepted.
+            //
+            Some(EpollListener::HostSock) => {
+                if self.conn_map.len() == defs::MAX_CONNECTIONS {
+                    // If we're already maxed-out on connections, we'll just accept and
+                    // immediately discard this potentially new one.
+                    warn!("vsock: connection limit reached; refusing new host connection");
+                    self.host_sock.accept().map(|_| 0).unwrap_or(0);
+                    return;
+                }
+
+                let tm = std::time::Instant::now();
+                let conn_info = ConnectionInfo {
+                    unix_accept_time: tm,
+                    send_connect_time: tm,
+                };
+
+                self.host_sock
+                    .accept()
+                    .map_err(Error::UnixAccept)
+                    .and_then(|(stream, _)| {
+                        stream
+                            .set_nonblocking(true)
+                            .map(|_| stream)
+                            .map_err(Error::UnixAccept)
+                    })
+                    .and_then(|stream| {
+                        // Before forwarding this connection to a listening AF_VSOCK socket on
+                        // the guest side, we need to know the destination port. We'll read
+                        // that port from a "connect" command received on this socket, so the
+                        // next step is to ask to be notified the moment we can read from it.
+                        self.conn_info.insert(stream.as_raw_fd(), conn_info);
+                        debug!("vsock unix accept {:?}", tm);
+                        self.add_listener(stream.as_raw_fd(), EpollListener::LocalStream(stream))
+                    })
+                    .unwrap_or_else(|err| {
+                        warn!("vsock: unable to accept local connection: {:?}", err);
+                    });
+            }
+
+            // Data is ready to be read from a host-initiated connection. That would be the
+            // "connect" command that we're expecting.
+            Some(EpollListener::LocalStream(_)) => {
+                if let Some(EpollListener::LocalStream(mut stream)) = self.remove_listener(fd) {
+                    Self::read_local_stream_port(self, &mut stream)
+                        .map(|peer_port| (self.allocate_local_port(), peer_port))
+                        .and_then(|(local_port, peer_port)| {
+                            info!(
+                                "vsock: local-init connection: local_port={}, peer_port={}",
+                                local_port, peer_port
+                            );
+                            self.add_connection(
+                                ConnMapKey {
+                                    local_port,
+                                    peer_port,
+                                },
+                                MuxerConnection::new_local_init(
+                                    stream,
+                                    uapi::VSOCK_HOST_CID,
+                                    self.cid,
+                                    local_port,
+                                    peer_port,
+                                ),
+                            )
+                        })
+                        .unwrap_or_else(|err| {
+                            info!("vsock: error adding local-init connection: {:?}", err);
+                        })
+                }
+            }
+
+            _ => {
+                info!(
+                    "vsock: unexpected event: fd={:?}, event_set={:?}",
+                    fd, event_set
+                );
+            }
+        }
     }
 
     /// Handle/dispatch an epoll event to its listener.
@@ -417,9 +631,13 @@ impl VsockMuxer {
             // "connect" command that we're expecting.
             Some(EpollListener::LocalStream(_)) => {
                 if let Some(EpollListener::LocalStream(mut stream)) = self.remove_listener(fd) {
-                    Self::read_local_stream_port(&mut stream)
+                    Self::read_local_stream_port(self, &mut stream)
                         .map(|peer_port| (self.allocate_local_port(), peer_port))
                         .and_then(|(local_port, peer_port)| {
+                            info!(
+                                "vsock: local-init connection: local_port={}, peer_port={}",
+                                local_port, peer_port
+                            );
                             self.add_connection(
                                 ConnMapKey {
                                     local_port,
@@ -451,7 +669,7 @@ impl VsockMuxer {
 
     /// Parse a host "connect" command, and extract the destination vsock port.
     ///
-    fn read_local_stream_port(stream: &mut UnixStream) -> Result<u32> {
+    fn read_local_stream_port(&mut self, stream: &mut UnixStream) -> Result<u32> {
         let mut buf = [0u8; 32];
 
         // This is the minimum number of bytes that we should be able to read, when parsing a
@@ -483,6 +701,11 @@ impl VsockMuxer {
             .ok_or(Error::InvalidPortRequest)
             .and_then(|word| {
                 if word.to_lowercase() == "connect" {
+                    if let Some(conn_info) = self.conn_info.get_mut(&stream.as_raw_fd()) {
+                        let tm = std::time::Instant::now();
+                        conn_info.send_connect_time = tm;
+                    }
+
                     Ok(())
                 } else {
                     Err(Error::InvalidPortRequest)
@@ -532,10 +755,30 @@ impl VsockMuxer {
     /// Remove a connection from the active connection poll.
     ///
     fn remove_connection(&mut self, key: ConnMapKey) {
+        let tm1 = std::time::Instant::now();
+        let mut fd = -1;
         if let Some(conn) = self.conn_map.remove(&key) {
+            fd = conn.get_polled_fd();
             self.remove_listener(conn.get_polled_fd());
         }
         self.free_local_port(key.local_port);
+
+        if let Some(conn_info) = self.conn_info.remove(&fd) {
+            let unix_accept_time = conn_info.unix_accept_time;
+            let send_connect_time = conn_info.send_connect_time;
+            let tm2 = std::time::Instant::now();
+            let unix_accept_cost = send_connect_time
+                .duration_since(unix_accept_time)
+                .as_micros();
+            let rst_cost = tm1.duration_since(send_connect_time).as_micros();
+            let free_cost = tm2.duration_since(tm1).as_micros();
+            if (unix_accept_cost + rst_cost + free_cost) > 20_000 {
+                info!(
+                    "vsock remove connection unix accept cost {} us, rst {} us, free_cost {} us",
+                    unix_accept_cost, rst_cost, free_cost
+                );
+            }
+        }
     }
 
     /// Schedule a connection for immediate termination.
@@ -567,13 +810,27 @@ impl VsockMuxer {
             EpollListener::HostSock => epoll::Events::EPOLLIN,
         };
 
+        let mut epfd = self.epoll_file.as_raw_fd();
+        let mut event_data = fd as u64;
+        if !self.epoll_nested {
+            epfd = self.helper_fd;
+            event_data = ((fd as u64) << 32) | (MUXER_EPOLL_EVENT as u64);
+        }
+
+        debug!(
+            "vsock epoll_nested {} epoll add fd {} data {}",
+            self.epoll_nested, fd, event_data
+        );
         epoll::ctl(
-            self.epoll_file.as_raw_fd(),
+            // self.epoll_file.as_raw_fd(),
+            epfd,
             epoll::ControlOptions::EPOLL_CTL_ADD,
             fd,
-            epoll::Event::new(evset, fd as u64),
+            // epoll::Event::new(evset, fd as u64),
+            epoll::Event::new(evset, event_data),
         )
         .map(|_| {
+            debug!("vsock epoll added");
             self.listener_map.insert(fd, listener);
         })
         .map_err(Error::EpollAdd)?;
@@ -586,9 +843,14 @@ impl VsockMuxer {
     fn remove_listener(&mut self, fd: RawFd) -> Option<EpollListener> {
         let maybe_listener = self.listener_map.remove(&fd);
 
+        let mut epfd = self.epoll_file.as_raw_fd();
+        if !self.epoll_nested {
+            epfd = self.helper_fd;
+        }
+
         if maybe_listener.is_some() {
             epoll::ctl(
-                self.epoll_file.as_raw_fd(),
+                epfd,
                 epoll::ControlOptions::EPOLL_CTL_DEL,
                 fd,
                 epoll::Event::new(epoll::Events::empty(), 0),
@@ -635,7 +897,13 @@ impl VsockMuxer {
     /// RST packet will be scheduled for delivery to the guest.
     ///
     fn handle_peer_request_pkt(&mut self, pkt: &VsockPacket) {
-        let port_path = format!("{}_{}", self.host_sock_path, pkt.dst_port());
+		let mut port_path = format!("{}_{}", self.host_sock_path, pkt.dst_port());
+
+        if let Some(path) = self.is_cube_vsock_dbg_port(pkt.dst_port()) {
+			port_path = path;
+        }
+
+		debug!("vsock: port_path {}", port_path);
 
         UnixStream::connect(port_path)
             .and_then(|stream| stream.set_nonblocking(true).map(|_| stream))
@@ -682,6 +950,20 @@ impl VsockMuxer {
             // to send an ack message to the host end.
             if prev_state == ConnState::LocalInit && conn.state() == ConnState::Established {
                 let msg = format!("OK {}\n", key.local_port);
+                let fd = conn.get_polled_fd();
+                if let Some(conn_info) = self.conn_info.get_mut(&fd) {
+                    let unix_accept_time = conn_info.unix_accept_time;
+                    let send_connect_time = conn_info.send_connect_time;
+                    let unix_accept_cost = send_connect_time
+                        .duration_since(unix_accept_time)
+                        .as_micros();
+                    let conn_cost = std::time::Instant::now()
+                        .duration_since(send_connect_time)
+                        .as_micros();
+                    info!("vsock unix accept cost {} us, established {} us, timestamp: {:?}-{:?}-{:?}",
+                          unix_accept_cost, conn_cost, unix_accept_time, send_connect_time, std::time::Instant::now());
+                }
+
                 match conn.send_bytes_raw(msg.as_bytes()) {
                     Ok(written) if written == msg.len() => (),
                     Ok(_) => {
@@ -728,21 +1010,40 @@ impl VsockMuxer {
                     );
 
                     *evset = new_evset;
-                    epoll::ctl(
-                        self.epoll_file.as_raw_fd(),
+
+                    let mut epfd = self.epoll_file.as_raw_fd();
+                    let mut event_data = fd as u64;
+                    if !self.epoll_nested {
+                        epfd = self.helper_fd;
+                        event_data = ((fd as u64) << 32) | (MUXER_EPOLL_EVENT as u64);
+                    }
+                    // Update epoll listener to handle possible errors
+                    if let Err(e) = epoll::ctl(
+                        epfd,
                         epoll::ControlOptions::EPOLL_CTL_MOD,
                         fd,
-                        epoll::Event::new(new_evset, fd as u64),
-                    )
-                    .unwrap_or_else(|err| {
-                        // This really shouldn't happen, like, ever. However, "famous last
-                        // words" and all that, so let's just kill it with fire, and walk away.
-                        self.kill_connection(key);
-                        error!(
-                            "vsock: error updating epoll listener for (lp={}, pp={}): {:?}",
-                            key.local_port, key.peer_port, err
-                        );
-                    });
+                        epoll::Event::new(*evset, event_data),
+                    ) {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            debug!(
+                                "vsock: removing invalid fd connection (lp={}, pp={})",
+                                key.local_port, key.peer_port
+                            );
+                            self.conn_map.remove(&key);
+                            self.listener_map.remove(&fd);
+                        } else if e.kind() == std::io::ErrorKind::Interrupted
+                            || e.kind() == std::io::ErrorKind::WouldBlock
+                        {
+                            warn!(
+                            "vsock: recoverable error updating epoll listener for (lp={}, pp={}): {:?}",
+                            key.local_port, key.peer_port, e);
+                        } else {
+                            warn!(
+                                "vsock: fatal error updating epoll listener for (lp={}, pp={}): {:?}",
+                                key.local_port, key.peer_port, e);
+                            self.kill_connection(key);
+                        }
+                    }
                 }
             } else {
                 // The connection had previously asked to be removed from the listener map (by
@@ -797,6 +1098,7 @@ impl VsockMuxer {
     /// packet means we have to drop it, which is not normal operation.
     ///
     fn enq_rst(&mut self, local_port: u32, peer_port: u32) {
+        debug!("vsock: send VSOCK_OP_RST to guest");
         let pushed = self.rxq.push(MuxerRx::RstPkt {
             local_port,
             peer_port,
@@ -806,6 +1108,12 @@ impl VsockMuxer {
                 "vsock: muxer.rxq full; dropping RST packet for lp={}, pp={}",
                 local_port, peer_port
             );
+        }
+    }
+
+    fn state(&self) -> VsockMuxerState {
+        VsockMuxerState {
+            local_port_set: self.local_port_set.clone(),
         }
     }
 }
@@ -852,7 +1160,8 @@ mod tests {
             )
             .unwrap();
             let uds_path = format!("test_vsock_{}.sock", name);
-            let muxer = VsockMuxer::new(PEER_CID, uds_path).unwrap();
+            let id = format!("test_vsock_{name}");
+            let muxer = VsockMuxer::new(id, PEER_CID, uds_path, true, None).unwrap();
 
             Self {
                 _vsock_test_ctx: vsock_test_ctx,

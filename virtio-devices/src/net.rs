@@ -23,6 +23,7 @@ use net_util::{
     Tap, TapError, TxVirtio, VirtioNetConfig,
 };
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::num::Wrapping;
 use std::ops::Deref;
@@ -34,13 +35,10 @@ use std::thread;
 use std::vec::Vec;
 use std::{collections::HashMap, convert::TryInto};
 use thiserror::Error;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use virtio_bindings::bindings::virtio_net::*;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{ByteValued, GuestAddressSpace, GuestMemoryAtomic};
-use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::EventFd;
@@ -422,15 +420,13 @@ pub struct Net {
     exit_evt: EventFd,
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 pub struct NetState {
     pub avail_features: u64,
     pub acked_features: u64,
     pub config: VirtioNetConfig,
     pub queue_size: Vec<u16>,
 }
-
-impl VersionMapped for NetState {}
 
 impl Net {
     /// Create a new virtio network device with the given TAP interface.
@@ -452,7 +448,7 @@ impl Net {
         let mtu = taps[0].mtu().map_err(Error::TapError)? as u16;
 
         let (avail_features, acked_features, config, queue_sizes) = if let Some(state) = state {
-            info!("Restoring virtio-net {}", id);
+            debug!("Restoring virtio-net {}", id);
             (
                 state.avail_features,
                 state.acked_features,
@@ -542,6 +538,7 @@ impl Net {
         rate_limiter_config: Option<RateLimiterConfig>,
         exit_evt: EventFd,
         state: Option<NetState>,
+        #[allow(unused_variables)] sandbox_id: Option<String>,
     ) -> Result<Self> {
         let taps = open_tap(
             if_name,
@@ -551,6 +548,7 @@ impl Net {
             mtu,
             num_queues / 2,
             None,
+            sandbox_id,
         )
         .map_err(Error::OpenTap)?;
 
@@ -735,11 +733,14 @@ impl VirtioDevice for Net {
                 .map_err(ActivateError::CreateRateLimiter)?;
 
             let tap = taps.remove(0);
-            tap.set_offload(virtio_features_to_tap_offload(self.common.acked_features))
-                .map_err(|e| {
-                    error!("Error programming tap offload: {:?}", e);
-                    ActivateError::BadActivate
-                })?;
+
+            if !tap.is_donated() {
+                tap.set_offload(virtio_features_to_tap_offload(self.common.acked_features))
+                    .map_err(|e| {
+                        error!("Error programming tap offload: {:?}", e);
+                        ActivateError::BadActivate
+                    })?;
+            }
 
             let mut handler = NetEpollHandler {
                 net: NetQueuePair {
@@ -757,6 +758,9 @@ impl VirtioDevice for Net {
                     rx_rate_limiter,
                     tx_rate_limiter,
                     access_platform: self.common.access_platform.clone(),
+                    rx_rate_limited: std::sync::Once::new(),
+                    tx_rate_limited: std::sync::Once::new(),
+                    id: self.id.clone(),
                 },
                 mem: mem.clone(),
                 queue_index_base: (i * 2) as u16,
@@ -805,12 +809,28 @@ impl VirtioDevice for Net {
             Wrapping(self.counters.rx_frames.load(Ordering::Acquire)),
         );
         counters.insert(
+            "rx_limit_bytes",
+            Wrapping(self.counters.rx_limit_bytes.load(Ordering::Acquire)),
+        );
+        counters.insert(
+            "rx_limit_frames",
+            Wrapping(self.counters.rx_limit_frames.load(Ordering::Acquire)),
+        );
+        counters.insert(
             "tx_bytes",
             Wrapping(self.counters.tx_bytes.load(Ordering::Acquire)),
         );
         counters.insert(
             "tx_frames",
             Wrapping(self.counters.tx_frames.load(Ordering::Acquire)),
+        );
+        counters.insert(
+            "tx_limit_bytes",
+            Wrapping(self.counters.tx_limit_bytes.load(Ordering::Acquire)),
+        );
+        counters.insert(
+            "tx_limit_frames",
+            Wrapping(self.counters.tx_limit_frames.load(Ordering::Acquire)),
         );
 
         Some(counters)
@@ -842,7 +862,7 @@ impl Snapshottable for Net {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        Snapshot::new_from_state(&self.id, &self.state())
     }
 }
 impl Transportable for Net {}

@@ -19,6 +19,7 @@ pub use self::unix::VsockUnixError;
 
 pub use packet::VsockPacket;
 use std::os::unix::io::RawFd;
+use vm_migration::Snapshottable;
 
 mod defs {
 
@@ -30,6 +31,8 @@ mod defs {
         /// Vsock packet operation IDs.
         /// Defined in `/include/uapi/linux/virtio_vsock.h`.
         ///
+        /// Connection invalid.
+        pub const VSOCK_OP_INVALID: u16 = 0;
         /// Connection request.
         pub const VSOCK_OP_REQUEST: u16 = 1;
         /// Connection response.
@@ -58,6 +61,8 @@ mod defs {
         ///
         /// Stream / connection-oriented packet (the only currently valid type).
         pub const VSOCK_TYPE_STREAM: u16 = 1;
+
+        pub const VSOCK_TYPE_SEQPACKET: u16 = 2;
 
         pub const VSOCK_HOST_CID: u64 = 2;
     }
@@ -128,6 +133,20 @@ pub trait VsockEpollListener {
 
     /// Notify the listener that one ore more events have occurred.
     fn notify(&mut self, evset: epoll::Events);
+
+    /// If muxer epoll is nested.
+    fn muxer_epoll_nested(&self) -> bool {
+        true
+    }
+
+    /// Set epoll helper fd to muxer
+    fn set_epoll_helper_fd(&mut self, _epfd: RawFd) {}
+
+    /// add host_sock fd to listener map
+    fn add_host_sock(&mut self) {}
+
+    /// Handle host socket event
+    fn dispatch_muxer_event(&mut self, _fd: RawFd, _event_set: epoll::Events) {}
 }
 
 /// Any channel that handles vsock packet traffic: sending and receiving packets. Since we're
@@ -155,7 +174,7 @@ pub trait VsockChannel {
 /// sendable through a mpsc channel (the latter due to how `vmm::EpollContext` works).
 /// Currently, the only implementation we have is `crate::virtio::unix::muxer::VsockMuxer`, which
 /// translates guest-side vsock connections to host-side Unix domain socket connections.
-pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
+pub trait VsockBackend: VsockChannel + Snapshottable + VsockEpollListener + Send {}
 
 #[cfg(test)]
 mod tests {
@@ -172,6 +191,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
     use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use vm_memory::{GuestAddress, GuestMemoryAtomic};
+    use vm_migration::Pausable;
     use vm_virtio::queue::testing::VirtQueue as GuestQ;
     use vmm_sys_util::eventfd::EventFd;
 
@@ -251,6 +271,9 @@ mod tests {
             self.evset = Some(evset);
         }
     }
+
+    impl Pausable for TestBackend {}
+    impl Snapshottable for TestBackend {}
     impl VsockBackend for TestBackend {}
 
     pub struct TestContext {

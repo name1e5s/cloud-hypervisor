@@ -26,6 +26,7 @@ pub enum Thread {
     VirtioVhostNetCtl,
     VirtioVsock,
     VirtioWatchdog,
+    VirtioFs,
 }
 
 /// Shorthand for chaining `SeccompCondition`s with the `and` operator  in a `SeccompRule`.
@@ -210,6 +211,180 @@ fn virtio_watchdog_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     ]
 }
 
+fn virtio_fs_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+    vec![
+        (libc::SYS_accept4, vec![]),
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_capget, vec![]), // For CAP_FSETID
+        (libc::SYS_capset, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_clone, vec![]),
+        (libc::SYS_clone3, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_copy_file_range, vec![]),
+        (libc::SYS_dup, vec![]),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "s390x",
+            target_arch = "powerpc64le"
+        ))]
+        (libc::SYS_epoll_create, vec![]),
+        (libc::SYS_epoll_create1, vec![]),
+        (libc::SYS_epoll_ctl, vec![]),
+        (libc::SYS_epoll_pwait, vec![]),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "s390x",
+            target_arch = "powerpc64le"
+        ))]
+        (libc::SYS_epoll_wait, vec![]),
+        (libc::SYS_eventfd2, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_exit_group, vec![]),
+        (libc::SYS_fallocate, vec![]),
+        (libc::SYS_fchdir, vec![]),
+        (libc::SYS_fchmod, vec![]),
+        (libc::SYS_fchmodat, vec![]),
+        (libc::SYS_fchownat, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_fdatasync, vec![]),
+        (libc::SYS_fgetxattr, vec![]),
+        (libc::SYS_flistxattr, vec![]),
+        (libc::SYS_flock, vec![]),
+        (libc::SYS_fremovexattr, vec![]),
+        (libc::SYS_fsetxattr, vec![]),
+        (libc::SYS_fstat, vec![]),
+        #[cfg(target_arch = "s390x")]
+        (libc::SYS_fstatfs64, vec![]),
+        (libc::SYS_fstatfs, vec![]),
+        (libc::SYS_fsync, vec![]),
+        (libc::SYS_ftruncate, vec![]),
+        (libc::SYS_futex, vec![]),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "s390x",
+            target_arch = "powerpc64le"
+        ))]
+        (libc::SYS_getdents, vec![]),
+        (libc::SYS_getdents64, vec![]),
+        (libc::SYS_getegid, vec![]),
+        (libc::SYS_geteuid, vec![]),
+        (libc::SYS_getpid, vec![]),
+        (libc::SYS_gettid, vec![]),
+        (libc::SYS_gettimeofday, vec![]),
+        (libc::SYS_getxattr, vec![]),
+        (libc::SYS_linkat, vec![]),
+        (libc::SYS_listxattr, vec![]),
+        (libc::SYS_lseek, vec![]),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "s390x",
+            target_arch = "powerpc64le"
+        ))]
+        (libc::SYS_lstat, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mkdirat, vec![]),
+        (libc::SYS_mknodat, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_mremap, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_name_to_handle_at, vec![]),
+        (libc::SYS_newfstatat, vec![]),
+        #[cfg(any(
+            target_arch = "x86_64",
+            target_arch = "s390x",
+            target_arch = "powerpc64le"
+        ))]
+        (libc::SYS_open, vec![]),
+        (libc::SYS_openat, vec![]),
+        (libc::SYS_openat2, vec![]),
+        (libc::SYS_open_by_handle_at, vec![]),
+        (libc::SYS_prctl, vec![]),
+        (libc::SYS_preadv, vec![]),
+        (libc::SYS_prlimit64, vec![]),
+        (libc::SYS_pwritev, vec![]),
+        (libc::SYS_pwritev2, vec![]),
+        (libc::SYS_read, vec![]),
+        (libc::SYS_readlinkat, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_renameat, vec![]),
+        (libc::SYS_renameat2, vec![]),
+        (libc::SYS_removexattr, vec![]),
+        (libc::SYS_rt_sigaction, vec![]),
+        (libc::SYS_rt_sigprocmask, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sched_getaffinity, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_setresgid, vec![]),
+        (libc::SYS_setresuid, vec![]),
+        //(libc::SYS_setresgid32);  Needed on some platforms,
+        //(libc::SYS_setresuid32);  Needed on some platforms
+        (libc::SYS_setxattr, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        #[cfg(target_arch = "s390x")]
+        (libc::SYS_sigreturn, vec![]),
+        (libc::SYS_statx, vec![]),
+        (libc::SYS_symlinkat, vec![]),
+        (libc::SYS_syncfs, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_time, vec![]), // Rarely needed, except on static builds
+        (libc::SYS_umask, vec![]),
+        (libc::SYS_unshare, vec![]),
+        (libc::SYS_utimensat, vec![]),
+        (libc::SYS_write, vec![]),
+        (libc::SYS_writev, vec![]),
+        (libc::SYS_timerfd_create, vec![]),
+        (libc::SYS_timerfd_settime, vec![]),
+    ]
+}
+
+pub fn create_virtio_device_ioctl_seccomp_rule() -> Vec<SeccompRule> {
+    let mut common_rules = vec![];
+    let rules = create_virtio_console_ioctl_seccomp_rule();
+    common_rules.extend(rules);
+    let rules = create_virtio_net_ctl_ioctl_seccomp_rule();
+    common_rules.extend(rules);
+    let rules = create_vsock_ioctl_seccomp_rule();
+    common_rules.extend(rules);
+    common_rules
+}
+
+pub fn virtio_device_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
+    let mut rules = vec![
+        (libc::SYS_gettid, vec![]),
+        (libc::SYS_gettimeofday, vec![]),
+        (libc::SYS_getuid, vec![]),
+        // to support operations in init_backendfs()
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_lstat, vec![]),
+        (libc::SYS_prlimit64, vec![]),
+    ];
+
+    rules.append(&mut virtio_block_thread_rules());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut virtio_net_thread_rules());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut virtio_net_ctl_thread_rules());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut virtio_pmem_thread_rules());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut virtio_rng_thread_rules());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut virtio_vsock_thread_rules());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut virtio_fs_thread_rules());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+    rules.append(&mut virtio_thread_common());
+    rules.retain(|(num, _)| *num != libc::SYS_ioctl);
+
+    let mut ioctl_rules = vec![(libc::SYS_ioctl, create_virtio_device_ioctl_seccomp_rule())];
+    rules.append(&mut ioctl_rules);
+
+    rules
+}
+
 fn get_seccomp_rules(thread_type: Thread) -> Vec<(i64, Vec<SeccompRule>)> {
     let mut rules = match thread_type {
         Thread::VirtioBalloon => virtio_balloon_thread_rules(),
@@ -227,6 +402,7 @@ fn get_seccomp_rules(thread_type: Thread) -> Vec<(i64, Vec<SeccompRule>)> {
         Thread::VirtioVhostNetCtl => virtio_vhost_net_ctl_thread_rules(),
         Thread::VirtioVsock => virtio_vsock_thread_rules(),
         Thread::VirtioWatchdog => virtio_watchdog_thread_rules(),
+        Thread::VirtioFs => virtio_fs_thread_rules(),
     };
     rules.append(&mut virtio_thread_common());
     rules
@@ -265,6 +441,7 @@ pub fn get_seccomp_filter(
 ) -> Result<BpfProgram, Error> {
     match seccomp_action {
         SeccompAction::Allow => Ok(vec![]),
+        SeccompAction::KillProcess => Ok(vec![]),
         SeccompAction::Log => SeccompFilter::new(
             get_seccomp_rules(thread_type).into_iter().collect(),
             SeccompAction::Log,

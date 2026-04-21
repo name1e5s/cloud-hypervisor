@@ -21,6 +21,7 @@ use pci::{
     PciCapability, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
     PciHeaderType, PciMassStorageSubclass, PciNetworkControllerSubclass, PciSubclass,
 };
+use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::cmp;
 use std::io::Write;
@@ -28,8 +29,6 @@ use std::ops::Deref;
 use std::result;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use virtio_queue::{Error as QueueError, Queue, QueueT};
 use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
@@ -38,9 +37,7 @@ use vm_device::interrupt::{
 };
 use vm_device::{BusDevice, PciBarType, Resource};
 use vm_memory::{Address, ByteValued, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, Le32};
-use vm_migration::{
-    Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, VersionMapped,
-};
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
 use vmm_sys_util::{errno::Result, eventfd::EventFd};
 
@@ -48,7 +45,7 @@ use vmm_sys_util::{errno::Result, eventfd::EventFd};
 const VIRTQ_MSI_NO_VECTOR: u16 = 0xffff;
 
 #[derive(Debug)]
-enum Error {
+pub enum Error {
     /// Failed to retrieve queue ring's index.
     QueueRingIndex(QueueError),
 }
@@ -269,7 +266,7 @@ const NOTIFY_OFF_MULTIPLIER: u32 = 4; // A dword per notification address.
 const VIRTIO_PCI_VENDOR_ID: u16 = 0x1af4;
 const VIRTIO_PCI_DEVICE_ID_BASE: u16 = 0x1040; // Add to device type to get device ID.
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 struct QueueState {
     max_size: u16,
     size: u16,
@@ -279,14 +276,12 @@ struct QueueState {
     used_ring: u64,
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 struct VirtioPciDeviceState {
     device_activated: bool,
     queues: Vec<QueueState>,
     interrupt_status: usize,
 }
-
-impl VersionMapped for VirtioPciDeviceState {}
 
 pub struct VirtioPciDeviceActivator {
     interrupt: Option<Arc<dyn VirtioInterrupt>>,
@@ -1170,8 +1165,7 @@ impl Snapshottable for VirtioPciDevice {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        let mut virtio_pci_dev_snapshot =
-            Snapshot::new_from_versioned_state(&self.id, &self.state())?;
+        let mut virtio_pci_dev_snapshot = Snapshot::new_from_state(&self.id, &self.state())?;
 
         // Snapshot PciConfiguration
         virtio_pci_dev_snapshot.add_snapshot(self.configuration.snapshot()?);
@@ -1214,7 +1208,7 @@ impl Snapshottable for VirtioPciDevice {
             }
 
             // First restore the status of the virtqueues.
-            self.set_state(&virtio_pci_dev_section.to_versioned_state()?)
+            self.set_state(&virtio_pci_dev_section.to_state()?)
                 .map_err(|e| {
                     MigratableError::Restore(anyhow!(
                         "Could not restore VIRTIO_PCI_DEVICE state {:?}",
