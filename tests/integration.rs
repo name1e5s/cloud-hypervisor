@@ -1154,6 +1154,172 @@ fn test_boot_from_vhost_user_blk(
     handle_child_output(r, &output);
 }
 
+fn _test_native_virtio_fs(hotplug: bool, pci_segment: Option<u16>) {
+    #[cfg(target_arch = "x86_64")]
+    let focal_image = FOCAL_IMAGE_NAME.to_string();
+    let focal = UbuntuDiskConfig::new(focal_image);
+    let guest = Guest::new(Box::new(focal));
+    let api_socket = temp_api_path(&guest.tmp_dir);
+
+    let mut workload_path = dirs::home_dir().unwrap();
+    workload_path.push("workloads");
+
+    let mut shared_dir = workload_path;
+    shared_dir.push("shared_dir");
+
+    #[cfg(target_arch = "x86_64")]
+    let kernel_path = direct_kernel_boot_path();
+
+    let mut guest_command = GuestCommand::new(&guest);
+    guest_command
+        .args(["--cpus", "boot=1"])
+        .args(["--memory", "size=512M,hotplug_size=2048M,shared=on"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .default_disks()
+        .default_net()
+        .args(["--api-socket", &api_socket]);
+    if pci_segment.is_some() {
+        guest_command.args(["--platform", "num_pci_segments=16"]);
+    }
+
+    let fs_params = format!(
+        "id=myfs0,tag=myfs,native=true,shared_dir={},cache={},num_queues=1,queue_size=1024{}",
+        shared_dir.to_str().unwrap(),
+        "always".to_owned(),
+        if let Some(pci_segment) = pci_segment {
+            format!(",pci_segment={}", pci_segment)
+        } else {
+            "".to_owned()
+        }
+    );
+
+    if !hotplug {
+        guest_command.args(["--fs", fs_params.as_str()]);
+    }
+
+    let mut child = guest_command.capture_output().spawn().unwrap();
+
+    let r = std::panic::catch_unwind(|| {
+        guest.wait_vm_boot(None).unwrap();
+
+        if hotplug {
+            // Add fs to the VM
+            let (cmd_success, cmd_output) =
+                remote_command_w_output(&api_socket, "add-fs", Some(&fs_params));
+            assert!(cmd_success);
+
+            if let Some(pci_segment) = pci_segment {
+                assert!(String::from_utf8_lossy(&cmd_output).contains(&format!(
+                    "{{\"id\":\"myfs0\",\"bdf\":\"{:04x}:00:01.0\"}}",
+                    pci_segment
+                )));
+            } else {
+                assert!(String::from_utf8_lossy(&cmd_output)
+                    .contains("{\"id\":\"myfs0\",\"bdf\":\"0000:00:06.0\"}"));
+            }
+
+            thread::sleep(std::time::Duration::new(10, 0));
+        }
+
+        // Mount shared directory through virtio_fs filesystem
+        guest
+            .ssh_command("mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/")
+            .unwrap();
+
+        // Check file1 exists and its content is "foo"
+        assert_eq!(
+            guest.ssh_command("cat mount_dir/file1").unwrap().trim(),
+            "foo"
+        );
+        // Check file2 does not exist
+        guest
+            .ssh_command("[ ! -f 'mount_dir/file2' ] || true")
+            .unwrap();
+
+        // Check file3 exists and its content is "bar"
+        assert_eq!(
+            guest.ssh_command("cat mount_dir/file3").unwrap().trim(),
+            "bar"
+        );
+
+        // ACPI feature is needed.
+        #[cfg(target_arch = "x86_64")]
+        {
+            guest.enable_memory_hotplug();
+
+            // Add RAM to the VM
+            let desired_ram = 1024 << 20;
+            resize_command(&api_socket, None, Some(desired_ram), None, None);
+
+            thread::sleep(std::time::Duration::new(30, 0));
+            assert!(guest.get_total_memory().unwrap_or_default() > 960_000);
+
+            // After the resize, check again that file1 exists and its
+            // content is "foo".
+            assert_eq!(
+                guest.ssh_command("cat mount_dir/file1").unwrap().trim(),
+                "foo"
+            );
+        }
+
+        if hotplug {
+            // Remove from VM
+            guest.ssh_command("sudo umount mount_dir").unwrap();
+            assert!(remote_command(&api_socket, "remove-device", Some("myfs0")));
+        }
+    });
+
+    let r = if r.is_ok() && hotplug {
+        std::panic::catch_unwind(|| {
+            thread::sleep(std::time::Duration::new(10, 0));
+            let fs_params = format!(
+                "id=myfs0,tag=myfs,native=true,shared_dir={},cache={},num_queues=1,queue_size=1024{}",
+                    shared_dir.to_str().unwrap(),
+                    "always".to_owned(),
+                if let Some(pci_segment) = pci_segment {
+                    format!(",pci_segment={}", pci_segment)
+                } else {
+                    "".to_owned()
+                }
+            );
+
+            // Add back and check it works
+            let (cmd_success, cmd_output) =
+                remote_command_w_output(&api_socket, "add-fs", Some(&fs_params));
+            assert!(cmd_success);
+            if let Some(pci_segment) = pci_segment {
+                assert!(String::from_utf8_lossy(&cmd_output).contains(&format!(
+                    "{{\"id\":\"myfs0\",\"bdf\":\"{:04x}:00:01.0\"}}",
+                    pci_segment
+                )));
+            } else {
+                assert!(String::from_utf8_lossy(&cmd_output)
+                    .contains("{\"id\":\"myfs0\",\"bdf\":\"0000:00:06.0\"}"));
+            }
+
+            thread::sleep(std::time::Duration::new(10, 0));
+            // Mount shared directory through virtio_fs filesystem
+            guest
+                .ssh_command("mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/")
+                .unwrap();
+
+            // Check file1 exists and its content is "foo"
+            assert_eq!(
+                guest.ssh_command("cat mount_dir/file1").unwrap().trim(),
+                "foo"
+            );
+        })
+    } else {
+        r
+    };
+
+    kill_child(&mut child);
+    let output = child.wait_with_output().unwrap();
+
+    handle_child_output(r, &output);
+}
+
 fn _test_virtio_fs(
     prepare_daemon: &dyn Fn(&TempDir, &str) -> (std::process::Child, String),
     hotplug: bool,
@@ -1907,6 +2073,7 @@ fn enable_guest_watchdog(guest: &Guest, watchdog_sec: u32) {
 
 mod common_parallel {
     use std::{fs::OpenOptions, io::SeekFrom};
+    use vmm::vm_config::MemoryConfig;
 
     use crate::*;
 
@@ -3484,7 +3651,7 @@ mod common_parallel {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
 
-        let serial_path = guest.tmp_dir.as_path().join("/tmp/serial-output");
+        let serial_path = guest.tmp_dir.as_path().join("serial-output");
         #[cfg(target_arch = "x86_64")]
         let console_str: &str = "console=ttyS0";
         #[cfg(target_arch = "aarch64")]
@@ -3683,7 +3850,7 @@ mod common_parallel {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
 
-        let console_path = guest.tmp_dir.as_path().join("/tmp/console-output");
+        let console_path = guest.tmp_dir.as_path().join("console-output");
         let mut child = GuestCommand::new(&guest)
             .args(["--cpus", "boot=1"])
             .args(["--memory", "size=512M"])
@@ -6762,11 +6929,700 @@ mod common_parallel {
 }
 
 mod common_sequential {
+    use vmm::vm_config::{DiskConfig, FsConfig, NetConfig, PmemConfig, VsockConfig};
+
     use crate::*;
 
     #[test]
     fn test_memory_mergeable_on() {
         test_memory_mergeable(true)
+    }
+
+    #[test]
+    fn test_snapshot_restore_from_config() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let kernel_path = direct_kernel_boot_path();
+
+        let api_socket_source = format!("{}.1", temp_api_path(&guest.tmp_dir));
+        let vsock_id = "_vsock0";
+
+        let net_id = "net123";
+        let tap_name = "vmtap0";
+        let net_params = format!(
+            "id={},tap={},mac={},ip={},mask=255.255.255.0",
+            net_id, tap_name, guest.network.guest_mac, guest.network.host_ip
+        );
+
+        let socket = temp_vsock_path(&guest.tmp_dir);
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+
+        let pmem_id = "pmem0";
+        let pmem_temp_file = TempFile::new().unwrap();
+        pmem_temp_file.as_file().set_len(128 << 20).unwrap();
+        Command::new("mkfs.ext4")
+            .arg(pmem_temp_file.as_path())
+            .output()
+            .expect("Expect creating disk image to succeed");
+
+        let mut workload_path = dirs::home_dir().unwrap();
+        workload_path.push("workloads");
+        // Prepare native virtiofs
+        let mut shared_dir = workload_path.clone();
+        shared_dir.push("shared_dir");
+        let fs_params = format!(
+            "id=myfs0,tag=myfs,native=true,shared_dir={},cache=always,num_queues=1,queue_size=1024",
+            shared_dir.to_str().unwrap()
+        );
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket_source])
+            .args(["--event-monitor", format!("path={}", event_path).as_str()])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=1G"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--net", net_params.as_str()])
+            .args([
+                "--disk",
+                format!(
+                    "id=osdisk,path={}",
+                    guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
+                )
+                .as_str(),
+                format!(
+                    "id=cloudinit,path={}",
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap()
+                )
+                .as_str(),
+            ])
+            .args([
+                "--pmem",
+                format!(
+                    "id={},file={}",
+                    pmem_id,
+                    pmem_temp_file.as_path().to_str().unwrap(),
+                )
+                .as_str(),
+            ])
+            .args(["--fs", fs_params.as_str()])
+            .args([
+                "--vsock",
+                format!("cid=3,id={},socket={}", vsock_id, socket).as_str(),
+            ])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        // Create the snapshot directory
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            // Check tap device name
+            let tap_count = exec_host_command_output(&format!("ip link | grep -c {}", tap_name));
+            assert_eq!(String::from_utf8_lossy(&tap_count.stdout).trim(), "1");
+
+            snapshot_and_check_events(
+                api_socket_source.as_str(),
+                snapshot_dir.as_str(),
+                event_path.as_str(),
+            );
+        });
+
+        // Shutdown the source VM and check console output
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        // Remove the vsock socket file.
+        Command::new("rm")
+            .arg("-f")
+            .arg(socket.as_str())
+            .output()
+            .unwrap();
+
+        // Prepare restore config
+        // vsock config
+        let socket_restored = format!("{}.2", temp_vsock_path(&guest.tmp_dir));
+        let vsock_config = VsockConfig::parse(
+            format!("cid=3,id={},socket={}", vsock_id, socket_restored).as_str(),
+        )
+        .unwrap();
+
+        // net config
+        let tap_name_restored = "restore-tap";
+        let net_params_restored = format!(
+            "id={},tap={},mac={},ip={},mask=255.255.255.0",
+            net_id, tap_name_restored, guest.network.guest_mac, guest.network.host_ip
+        );
+        let net_config = NetConfig::parse(net_params_restored.as_str()).unwrap();
+
+        // disk config
+        let mut osdisk_base_path = workload_path.clone();
+        osdisk_base_path.push(FOCAL_IMAGE_NAME);
+        let osdisk_path_restored = String::from(
+            guest
+                .tmp_dir
+                .as_path()
+                .join("osdisk2.img")
+                .to_str()
+                .unwrap(),
+        );
+        rate_limited_copy(osdisk_base_path, &osdisk_path_restored)
+            .expect("copying of OS source disk image failed");
+        let disk_params_restored = format!("id=osdisk,path={}", osdisk_path_restored);
+        let disk_config = DiskConfig::parse(disk_params_restored.as_str()).unwrap();
+
+        // pmem config
+        let pmem_temp_file_retored = TempFile::new().unwrap();
+        pmem_temp_file_retored.as_file().set_len(128 << 20).unwrap();
+        std::process::Command::new("mkfs.ext4")
+            .arg(pmem_temp_file_retored.as_path())
+            .output()
+            .expect("Expect creating disk image to succeed");
+        let pmem_config = PmemConfig::parse(
+            format!(
+                "id={},file={}",
+                pmem_id,
+                pmem_temp_file_retored.as_path().to_str().unwrap()
+            )
+            .as_str(),
+        )
+        .unwrap();
+
+        // fs config
+        let mut shared_dir_restored = workload_path.clone();
+        shared_dir_restored.push("restored_shared_dir");
+        let fs_params = format!(
+            "id=myfs0,tag=myfs,native=true,shared_dir={},cache=always,num_queues=1,queue_size=1024",
+            shared_dir_restored.to_str().unwrap()
+        );
+        let fs_config = FsConfig::parse(fs_params.as_str()).unwrap();
+
+        _test_restore_from_config(
+            clh_command("cube-hypervisor").as_str(),
+            &guest,
+            snapshot_dir,
+            Some(vsock_config),
+            Some(vec![net_config]),
+            Some(vec![disk_config]),
+            Some(vec![pmem_config]),
+            Some(vec![fs_config]),
+        );
+    }
+}
+
+mod compatibility {
+    use crate::_test_snapshot_restore_from_different_binary;
+    use test_infra::clh_command;
+
+    #[test]
+    fn test_snapshot_from_release_restore_on_head() {
+        let mut workload_path = dirs::home_dir().unwrap();
+        workload_path.push("workloads");
+        let mut release_path = workload_path.clone();
+        release_path.push("cube-release");
+        release_path.push("cube-hypervisor");
+
+        let head_path = clh_command("cube-hypervisor");
+        _test_snapshot_restore_from_different_binary(
+            release_path.to_str().unwrap(),
+            head_path.as_str(),
+        );
+    }
+}
+
+mod vmm_instance {
+    use std::path::PathBuf;
+    #[cfg(feature = "lib_support")]
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[cfg(feature = "lib_support")]
+    use cube_hypervisor::vmm_config::EventNotifyConfig;
+    use cube_hypervisor::vmm_config::{EventMonitorConfig, VmmConfig};
+    #[cfg(feature = "lib_support")]
+    use cube_hypervisor::NotifyEvent;
+    use cube_hypervisor::VmmInstance;
+    use log::LevelFilter;
+    use test_infra::{ssh_command_ip, DiskType, Guest, UbuntuDiskConfig};
+    use vmm::api::{ApiRequest, ApiResponsePayload, VmSnapshotConfig};
+    use vmm::config::RestoreConfig;
+    use vmm::vm_config::{
+        ConsoleConfig, ConsoleOutputMode, CpusConfig, DiskConfig, NetConfig, PayloadConfig,
+        VmConfig,
+    };
+
+    use crate::x86_64::FOCAL_IMAGE_NAME;
+    use crate::{
+        check_latest_events_exact, check_sequential_events, direct_kernel_boot_path,
+        temp_event_monitor_path, temp_snapshot_dir_path, MetaEvent, DIRECT_KERNEL_BOOT_CMDLINE,
+    };
+
+    struct DummyVmm {
+        vmm: VmmInstance,
+    }
+
+    impl DummyVmm {
+        pub fn new(config: VmmConfig) -> Self {
+            let vmm = VmmInstance::new(config).unwrap();
+            Self { vmm }
+        }
+
+        pub fn send_request(&self, req: ApiRequest) -> bool {
+            let req_info = format!("req {req:?}");
+            let response = self.vmm.send_request(req).expect("send request error");
+            match response {
+                Ok(body) => match body {
+                    ApiResponsePayload::Empty => true,
+                    ApiResponsePayload::VmInfo(_vm_info) => true,
+                    ApiResponsePayload::VmmPing(_ping_res) => true,
+                    ApiResponsePayload::VmWaitStart(_wait_start_res) => true,
+                    ApiResponsePayload::VmAction(_) => true,
+                },
+                Err(_) => {
+                    println!("error: {req_info}");
+                    false
+                }
+            }
+        }
+
+        pub fn join(&mut self) {
+            self.vmm.join().unwrap();
+        }
+
+        pub fn join_timeout(&mut self, timeout: Option<Duration>) {
+            self.vmm.join_timeout(timeout).unwrap();
+        }
+    }
+
+    fn default_vmm_config() -> VmmConfig {
+        VmmConfig {
+            log_stderr: true,
+            log_level: LevelFilter::Info,
+            ..Default::default()
+        }
+    }
+
+    fn default_vm_config() -> VmConfig {
+        VmConfig {
+            payload: Some(PayloadConfig {
+                kernel: Some(direct_kernel_boot_path()),
+                cmdline: Some(String::from(DIRECT_KERNEL_BOOT_CMDLINE)),
+                ..Default::default()
+            }),
+            serial: ConsoleConfig {
+                mode: ConsoleOutputMode::Tty,
+                ..Default::default()
+            },
+            console: ConsoleConfig {
+                mode: ConsoleOutputMode::Off,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn set_default_seccomp_rules() {
+        cube_hypervisor::set_runtime_seccomp_rules(vec![
+            (libc::SYS_sysinfo, vec![]),
+            (libc::SYS_getcwd, vec![]),
+        ]);
+    }
+
+    #[test]
+    // Start cube-hypervisor with no VM parameters, only the API server running.
+    // From the API: Create a VM, boot it and check that it looks as expected.
+    fn test_api_create_boot_and_shutdown() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        set_default_seccomp_rules();
+        let vmm_config = default_vmm_config();
+        let mut vmm = DummyVmm::new(vmm_config);
+
+        // Verify VMM service is running
+        assert!(vmm.send_request(ApiRequest::VmmPing));
+
+        // Create the VM first
+        let mut vm_config = default_vm_config();
+        let cpu_count = 4;
+        vm_config.cpus = CpusConfig {
+            boot_vcpus: cpu_count,
+            max_vcpus: cpu_count,
+            ..Default::default()
+        };
+        let mut disk_config = vec![];
+        disk_config.push(DiskConfig {
+            path: Some(PathBuf::from(
+                guest.disk_config.disk(DiskType::OperatingSystem).unwrap(),
+            )),
+            ..Default::default()
+        });
+        if guest.disk_config.disk(DiskType::CloudInit).is_some() {
+            disk_config.push(DiskConfig {
+                path: Some(PathBuf::from(
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap(),
+                )),
+                ..Default::default()
+            });
+        }
+
+        vm_config.disks = Some(disk_config);
+
+        let net_string = guest.default_net_string();
+        vm_config.net = Some(vec![NetConfig::parse(net_string.as_str()).unwrap()]);
+
+        assert!(vmm.send_request(ApiRequest::VmCreate(Box::new(vm_config))));
+
+        // Then boot it
+        assert!(vmm.send_request(ApiRequest::VmBoot));
+
+        guest.wait_vm_boot(None).unwrap();
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        assert!(vmm.send_request(ApiRequest::VmmShutdown));
+        vmm.join_timeout(Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_api_delete() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        set_default_seccomp_rules();
+        let vmm_config = default_vmm_config();
+        let mut vmm = DummyVmm::new(vmm_config);
+
+        // Verify VMM service is running
+        assert!(vmm.send_request(ApiRequest::VmmPing));
+
+        // Create the VM first
+        let mut vm_config = default_vm_config();
+        let cpu_count = 4;
+        vm_config.cpus = CpusConfig {
+            boot_vcpus: cpu_count,
+            max_vcpus: cpu_count,
+            ..Default::default()
+        };
+        let mut disk_config = vec![];
+        disk_config.push(DiskConfig {
+            path: Some(PathBuf::from(
+                guest.disk_config.disk(DiskType::OperatingSystem).unwrap(),
+            )),
+            ..Default::default()
+        });
+        if guest.disk_config.disk(DiskType::CloudInit).is_some() {
+            disk_config.push(DiskConfig {
+                path: Some(PathBuf::from(
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap(),
+                )),
+                ..Default::default()
+            });
+        }
+
+        vm_config.disks = Some(disk_config);
+
+        let net_string = guest.default_net_string();
+        vm_config.net = Some(vec![NetConfig::parse(net_string.as_str()).unwrap()]);
+
+        assert!(vmm.send_request(ApiRequest::VmCreate(Box::new(vm_config.clone()))));
+
+        // Then boot it
+        assert!(vmm.send_request(ApiRequest::VmBoot));
+
+        guest.wait_vm_boot(None).unwrap();
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+        // Waiting for ssh
+        thread::sleep(std::time::Duration::new(5, 0));
+
+        assert!(vmm.send_request(ApiRequest::VmDelete));
+
+        // Waiting for vm shuwdown
+        thread::sleep(std::time::Duration::new(5, 0));
+
+        assert!(vmm.send_request(ApiRequest::VmCreate(Box::new(vm_config))));
+        assert!(vmm.send_request(ApiRequest::VmBoot));
+
+        guest.wait_vm_boot(None).unwrap();
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+        assert!(vmm.send_request(ApiRequest::VmmShutdown));
+        vmm.join_timeout(Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_api_pause_resume() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        set_default_seccomp_rules();
+        let vmm_config = default_vmm_config();
+        let mut vmm = DummyVmm::new(vmm_config);
+
+        // Verify VMM service is running
+        assert!(vmm.send_request(ApiRequest::VmmPing));
+
+        // Create the VM first
+        let mut vm_config = default_vm_config();
+        let cpu_count = 4;
+        vm_config.cpus = CpusConfig {
+            boot_vcpus: cpu_count,
+            max_vcpus: cpu_count,
+            ..Default::default()
+        };
+        let mut disk_config = vec![];
+        disk_config.push(DiskConfig {
+            path: Some(PathBuf::from(
+                guest.disk_config.disk(DiskType::OperatingSystem).unwrap(),
+            )),
+            ..Default::default()
+        });
+        if guest.disk_config.disk(DiskType::CloudInit).is_some() {
+            disk_config.push(DiskConfig {
+                path: Some(PathBuf::from(
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap(),
+                )),
+                ..Default::default()
+            });
+        }
+
+        vm_config.disks = Some(disk_config);
+
+        let net_string = guest.default_net_string();
+        vm_config.net = Some(vec![NetConfig::parse(net_string.as_str()).unwrap()]);
+
+        assert!(vmm.send_request(ApiRequest::VmCreate(Box::new(vm_config))));
+
+        // Then boot it
+        assert!(vmm.send_request(ApiRequest::VmBoot));
+
+        guest.wait_vm_boot(None).unwrap();
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+        // We now pause the VM
+        assert!(vmm.send_request(ApiRequest::VmPause));
+        // Check pausing again fails
+        assert!(!vmm.send_request(ApiRequest::VmPause));
+
+        thread::sleep(std::time::Duration::new(1, 0));
+        // SSH into the VM should fail
+        assert!(ssh_command_ip(
+            "grep -c processor /proc/cpuinfo",
+            &guest.network.guest_ip,
+            2,
+            5
+        )
+        .is_err());
+
+        // Resume the VM
+        assert!(vmm.send_request(ApiRequest::VmResume));
+        // Check resuming again fails
+        assert!(!vmm.send_request(ApiRequest::VmResume));
+
+        thread::sleep(std::time::Duration::new(1, 0));
+        // Now we should be able to SSH back in and get the right number of CPUs
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+
+        assert!(vmm.send_request(ApiRequest::VmmShutdown));
+        vmm.join_timeout(Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_api_snapshot_restore() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+        // Create the snapshot directory
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+
+        set_default_seccomp_rules();
+        let mut vmm_config = default_vmm_config();
+        vmm_config.event_monitor = Some(EventMonitorConfig {
+            path: Some(event_path.clone()),
+            fd: None,
+        });
+        let mut vmm = DummyVmm::new(vmm_config);
+        // Verify VMM service is running
+        assert!(vmm.send_request(ApiRequest::VmmPing));
+
+        // Create the VM first
+        let mut vm_config = default_vm_config();
+        let cpu_count = 4;
+        vm_config.cpus = CpusConfig {
+            boot_vcpus: cpu_count,
+            max_vcpus: cpu_count,
+            ..Default::default()
+        };
+        let mut disk_config = vec![];
+        disk_config.push(DiskConfig {
+            path: Some(PathBuf::from(
+                guest.disk_config.disk(DiskType::OperatingSystem).unwrap(),
+            )),
+            ..Default::default()
+        });
+        if guest.disk_config.disk(DiskType::CloudInit).is_some() {
+            disk_config.push(DiskConfig {
+                path: Some(PathBuf::from(
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap(),
+                )),
+                ..Default::default()
+            });
+        }
+
+        vm_config.disks = Some(disk_config);
+
+        let net_string = guest.default_net_string();
+        vm_config.net = Some(vec![NetConfig::parse(net_string.as_str()).unwrap()]);
+
+        assert!(vmm.send_request(ApiRequest::VmCreate(Box::new(vm_config))));
+
+        // Then boot it
+        assert!(vmm.send_request(ApiRequest::VmBoot));
+
+        guest.wait_vm_boot(None).unwrap();
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+        assert!(vmm.send_request(ApiRequest::VmPause));
+        let latest_events = [
+            &MetaEvent {
+                event: "pausing".to_string(),
+                device_id: None,
+            },
+            &MetaEvent {
+                event: "paused".to_string(),
+                device_id: None,
+            },
+        ];
+        assert!(check_latest_events_exact(&latest_events, &event_path));
+
+        let snapshot_config = VmSnapshotConfig {
+            destination_url: format!("file://{snapshot_dir}"),
+        };
+        assert!(vmm.send_request(ApiRequest::VmSnapshot(Arc::new(snapshot_config))));
+        let latest_events = [
+            &MetaEvent {
+                event: "snapshotting".to_string(),
+                device_id: None,
+            },
+            &MetaEvent {
+                event: "snapshotted".to_string(),
+                device_id: None,
+            },
+        ];
+        assert!(check_latest_events_exact(&latest_events, &event_path));
+
+        assert!(vmm.send_request(ApiRequest::VmDelete));
+
+        let restore_config = RestoreConfig {
+            source_url: PathBuf::from(format!("file://{snapshot_dir}")),
+            ..Default::default()
+        };
+        assert!(vmm.send_request(ApiRequest::VmRestore(Arc::new(restore_config))));
+        // Wait for the VM to be restored
+        thread::sleep(std::time::Duration::new(10, 0));
+        let expected_events = [&MetaEvent {
+            event: "restoring".to_string(),
+            device_id: None,
+        }];
+        assert!(check_sequential_events(&expected_events, &event_path));
+
+        // Automatically restart the VM after it has been restored
+        let latest_events = [
+            &MetaEvent {
+                event: "restored".to_string(),
+                device_id: None,
+            },
+            &MetaEvent {
+                event: "resuming".to_string(),
+                device_id: None,
+            },
+            &MetaEvent {
+                event: "resumed".to_string(),
+                device_id: None,
+            },
+        ];
+        assert!(check_latest_events_exact(&latest_events, &event_path));
+        // Perform same checks to validate VM has been properly restored
+        assert_eq!(guest.get_cpu_count().unwrap_or_default(), 4);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+        assert!(vmm.send_request(ApiRequest::VmmShutdown));
+        vmm.join_timeout(Some(Duration::from_secs(5)));
+    }
+
+    #[cfg(feature = "lib_support")]
+    #[test]
+    fn test_get_shutdown_notifier() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        dummy_vmm_setup();
+        let mut vmm_config = default_vmm_config();
+        let (sender, receiver) = channel();
+        vmm_config.event_notifier = Some(EventNotifyConfig { notifier: sender });
+        let mut vmm = DummyVmm::new(vmm_config);
+
+        // Verify VMM service is running
+        assert!(vmm.send_request(ApiRequest::VmmPing));
+
+        // Create the VM first
+        let mut vm_config = default_vm_config();
+        let cpu_count = 4;
+        vm_config.cpus = CpusConfig {
+            boot_vcpus: cpu_count,
+            max_vcpus: cpu_count,
+            ..Default::default()
+        };
+        let mut disk_config = vec![];
+        disk_config.push(DiskConfig {
+            path: Some(PathBuf::from(
+                guest.disk_config.disk(DiskType::OperatingSystem).unwrap(),
+            )),
+            ..Default::default()
+        });
+        if guest.disk_config.disk(DiskType::CloudInit).is_some() {
+            disk_config.push(DiskConfig {
+                path: Some(PathBuf::from(
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap(),
+                )),
+                ..Default::default()
+            });
+        }
+        vm_config.disks = Some(disk_config);
+        let net_string = guest.default_net_string();
+        vm_config.net = Some(vec![NetConfig::parse(net_string.as_str()).unwrap()]);
+        assert!(vmm.send_request(ApiRequest::VmCreate(Box::new(vm_config))));
+
+        // Then boot it
+        assert!(vmm.send_request(ApiRequest::VmBoot));
+
+        guest.ssh_command("sudo reboot").unwrap();
+
+        let mut recv_evt_flag = false;
+        for _ in 0..3 {
+            let data = receiver.recv().unwrap();
+            if data == NotifyEvent::VmShutdown {
+                recv_evt_flag = true;
+                break;
+            }
+        }
+        assert!(recv_evt_flag);
     }
 }
 
