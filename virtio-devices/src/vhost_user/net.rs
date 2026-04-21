@@ -12,14 +12,13 @@ use crate::{
 use crate::{GuestMemoryMmap, GuestRegionMmap};
 use net_util::{build_net_config_space, CtrlQueue, MacAddr, VirtioNetConfig};
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use std::result;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::vec::Vec;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
-use vhost::vhost_user::{MasterReqHandler, VhostUserMaster, VhostUserMasterReqHandler};
+use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler};
 use virtio_bindings::bindings::virtio_net::{
     VIRTIO_NET_F_CSUM, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_GUEST_ECN,
     VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6, VIRTIO_NET_F_GUEST_UFO,
@@ -31,13 +30,13 @@ use virtio_queue::{Queue, QueueT};
 use vm_memory::{ByteValued, GuestMemoryAtomic};
 use vm_migration::{
     protocol::MemoryRangeTable, Migratable, MigratableError, Pausable, Snapshot, Snapshottable,
-    Transportable, VersionMapped,
+    Transportable,
 };
 use vmm_sys_util::eventfd::EventFd;
 
 const DEFAULT_QUEUE_NUMBER: usize = 2;
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 pub struct State {
     pub avail_features: u64,
     pub acked_features: u64,
@@ -46,10 +45,8 @@ pub struct State {
     pub vu_num_queues: usize,
 }
 
-impl VersionMapped for State {}
-
-struct SlaveReqHandler {}
-impl VhostUserMasterReqHandler for SlaveReqHandler {}
+struct BackendReqHandler {}
+impl VhostUserFrontendReqHandler for BackendReqHandler {}
 
 pub struct Net {
     common: VirtioCommon,
@@ -309,7 +306,7 @@ impl VirtioDevice for Net {
             self.ctrl_queue_epoll_thread = Some(epoll_threads.remove(0));
         }
 
-        let slave_req_handler: Option<MasterReqHandler<SlaveReqHandler>> = None;
+        let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
 
         // The backend acknowledged features must not contain VIRTIO_NET_F_MAC
         // since we don't expect the backend to handle it.
@@ -324,7 +321,7 @@ impl VirtioDevice for Net {
             queues,
             interrupt_cb,
             backend_acked_features,
-            slave_req_handler,
+            backend_req_handler,
             kill_evt,
             pause_evt,
         )?;
