@@ -5,4 +5,5 @@ authors = ["The Cloud Hypervisor Authors"]
 edition = "2021"
 
 [dependencies]
-vm-memory = "0.9.0"
+vm-memory = { workspace = true }
+zerocopy = "0.6.1"

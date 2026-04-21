@@ -8,7 +8,7 @@ edition = "2021"
 default = []
 
 [dependencies]
-anyhow = "1.0.66"
+anyhow = "1.0.86"
 arc-swap = "1.5.1"
 block_util = { path = "../block_util" }
 byteorder = "1.4.3"
@@ -21,19 +21,19 @@ net_gen = { path = "../net_gen" }
 net_util = { path = "../net_util" }
 pci = { path = "../pci" }
 rate_limiter = { path = "../rate_limiter" }
-seccompiler = "0.3.0"
-serde = { version = "1.0.147", features = ["derive"] }
+seccompiler = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0.87"
+serde_with = { version = "3.4.0", default-features = false, features = ["macros"] }
 serial_buffer = { path = "../serial_buffer" }
 thiserror = "1.0.37"
-versionize = "0.1.6"
-versionize_derive = "0.1.4"
-vhost = { version = "0.5.0", features = ["vhost-user-master", "vhost-user-slave", "vhost-kern", "vhost-vdpa"] }
+vhost = { workspace = true, features = ["vhost-user-frontend", "vhost-user-backend", "vhost-kern", "vhost-vdpa"] }
 virtio-bindings = { version = "0.1.0", features = ["virtio-v5_0_0"] }
-virtio-queue = "0.6.1"
+virtio-queue = { workspace = true }
 vm-allocator = { path = "../vm-allocator" }
 vm-device = { path = "../vm-device" }
-vm-memory = { version = "0.9.0", features = ["backend-mmap", "backend-atomic", "backend-bitmap"] }
+vm-memory = { workspace = true, features = ["backend-mmap", "backend-atomic", "backend-bitmap"] }
 vm-migration = { path = "../vm-migration" }
 vm-virtio = { path = "../vm-virtio" }
-vmm-sys-util = "0.10.0"
+vmm-sys-util = "0.12.1"
+virtiofsd = { workspace = true }

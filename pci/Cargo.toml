@@ -10,21 +10,19 @@ kvm = ["vfio-ioctls/kvm"]
 mshv = ["vfio-ioctls/mshv"]
 
 [dependencies]
-anyhow = "1.0.66"
+anyhow = "1.0.86"
 byteorder = "1.4.3"
 hypervisor = { path = "../hypervisor" }
-vfio-ioctls = { git = "https://github.com/rust-vmm/vfio", branch = "main", default-features = false }
+vfio-ioctls = { git = "https://github.com/rust-vmm/vfio", rev = "64171f3", default-features = false }
 vfio_user = { path = "../vfio_user" }
-vmm-sys-util = "0.10.0"
+vmm-sys-util = "0.12.1"
 libc = "0.2.137"
 log = "0.4.17"
-serde = { version = "1.0.147", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 thiserror = "1.0.37"
-versionize = "0.1.6"
-versionize_derive = "0.1.4"
 vm-allocator = { path = "../vm-allocator" }
 vm-device = { path = "../vm-device" }
-vm-memory = "0.9.0"
+vm-memory = { workspace = true, features = ["backend-bitmap"] }
 vm-migration = { path = "../vm-migration" }
 
 [dependencies.vfio-bindings]
