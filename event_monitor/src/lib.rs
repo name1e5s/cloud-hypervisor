@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-static mut MONITOR: Option<(File, Instant)> = None;
+static mut MONITOR: Option<Mutex<(File, Instant)>> = None;
 
 /// This function must only be called once from the main process before any threads
 /// are created to avoid race conditions
@@ -26,8 +27,9 @@ pub fn set_monitor(file: File) -> Result<(), std::io::Error> {
     if ret < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: MONITOR is None. Nobody else can hold a reference to it.
     unsafe {
-        MONITOR = Some((file, Instant::now()));
+        MONITOR = Some(Mutex::new((file, Instant::now())));
     };
     Ok(())
 }
@@ -41,17 +43,18 @@ struct Event<'a> {
 }
 
 pub fn event_log(source: &str, event: &str, properties: Option<&HashMap<Cow<str>, Cow<str>>>) {
-    if let Some((file, start)) = unsafe { MONITOR.as_ref() } {
+    // SAFETY: MONITOR is always in a valid state (None or Some).
+    if let Some(mutex) = unsafe { MONITOR.as_ref() } {
+        let mut guard = mutex.lock().unwrap();
         let e = Event {
-            timestamp: start.elapsed(),
+            timestamp: guard.1.elapsed(),
             source,
             event,
             properties,
         };
-        serde_json::to_writer_pretty(file, &e).ok();
+        serde_json::to_writer_pretty(&guard.0, &e).ok();
 
-        let mut file = file;
-        file.write_all(b"\n\n").ok();
+        guard.0.write_all(b"\n\n").ok();
     }
 }
 
