@@ -19,9 +19,11 @@ pub mod interrupt_controller;
 #[cfg(target_arch = "x86_64")]
 pub mod ioapic;
 pub mod legacy;
+pub mod pvpanic;
 pub mod tpm;
 
 pub use self::acpi::{AcpiGedDevice, AcpiPmTimerDevice, AcpiShutdownDevice};
+pub use self::pvpanic::{PvPanicDevice, PVPANIC_DEVICE_MMIO_SIZE};
 
 bitflags! {
     pub struct AcpiNotificationFlags: u8 {
