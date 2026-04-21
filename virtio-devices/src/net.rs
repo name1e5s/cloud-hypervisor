@@ -733,6 +733,7 @@ impl VirtioDevice for Net {
                 .map_err(ActivateError::CreateRateLimiter)?;
 
             let tap = taps.remove(0);
+
             if !tap.is_donated() {
                 tap.set_offload(virtio_features_to_tap_offload(self.common.acked_features))
                     .map_err(|e| {

@@ -61,6 +61,7 @@ pub use self::rng::Rng;
 pub use self::vdpa::{Vdpa, VdpaDmaMapping};
 pub use self::vsock::Vsock;
 pub use self::watchdog::Watchdog;
+
 use vm_memory::{bitmap::AtomicBitmap, GuestAddress, GuestMemory};
 use vm_virtio::VirtioDeviceType;
 
