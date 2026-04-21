@@ -18,6 +18,7 @@ use crate::{GuestMemoryMmap, MmapRegion};
 use crate::{VirtioInterrupt, VirtioInterruptType};
 use anyhow::anyhow;
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io;
 use std::mem::size_of;
@@ -26,14 +27,11 @@ use std::result;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier};
 use thiserror::Error;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
     GuestMemoryError, GuestMemoryLoadGuard,
 };
-use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::{AccessPlatform, Translatable};
 use vmm_sys_util::eventfd::EventFd;
@@ -48,7 +46,7 @@ const VIRTIO_PMEM_RESP_TYPE_EIO: u32 = 1;
 // New descriptors are pending on the virtio queue.
 const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 
-#[derive(Copy, Clone, Debug, Default, Versionize)]
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
 #[repr(C)]
 struct VirtioPmemConfig {
     start: u64,
@@ -279,14 +277,12 @@ pub struct Pmem {
     _region: MmapRegion,
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 pub struct PmemState {
     avail_features: u64,
     acked_features: u64,
     config: VirtioPmemConfig,
 }
-
-impl VersionMapped for PmemState {}
 
 impl Pmem {
     #[allow(clippy::too_many_arguments)]
@@ -302,7 +298,7 @@ impl Pmem {
         state: Option<PmemState>,
     ) -> io::Result<Pmem> {
         let (avail_features, acked_features, config) = if let Some(state) = state {
-            info!("Restoring virtio-pmem {}", id);
+            debug!("Restoring virtio-pmem {}", id);
             (state.avail_features, state.acked_features, state.config)
         } else {
             let config = VirtioPmemConfig {
@@ -447,7 +443,18 @@ impl VirtioDevice for Pmem {
 
 impl Pausable for Pmem {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
-        self.common.pause()
+        self.common.pause()?;
+
+        // Flush pmem backend file data to disk for cross-machine pause-snapshot
+        // scenarios, ensuring all written data is persisted before the
+        // snapshot is transferred to a remote host.
+        if let Some(disk) = self.disk.as_ref() {
+            disk.sync_all().map_err(|e| {
+                MigratableError::Pause(anyhow!("Failed to fsync pmem device {}: {}", self.id, e))
+            })?;
+        }
+
+        Ok(())
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
@@ -461,7 +468,7 @@ impl Snapshottable for Pmem {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        Snapshot::new_from_state(&self.id, &self.state())
     }
 }
 
