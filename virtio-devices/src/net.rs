@@ -23,6 +23,7 @@ use net_util::{
     Tap, TapError, TxVirtio, VirtioNetConfig,
 };
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::num::Wrapping;
 use std::ops::Deref;
@@ -34,13 +35,10 @@ use std::thread;
 use std::vec::Vec;
 use std::{collections::HashMap, convert::TryInto};
 use thiserror::Error;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use virtio_bindings::bindings::virtio_net::*;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{ByteValued, GuestAddressSpace, GuestMemoryAtomic};
-use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::EventFd;
@@ -422,15 +420,13 @@ pub struct Net {
     exit_evt: EventFd,
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 pub struct NetState {
     pub avail_features: u64,
     pub acked_features: u64,
     pub config: VirtioNetConfig,
     pub queue_size: Vec<u16>,
 }
-
-impl VersionMapped for NetState {}
 
 impl Net {
     /// Create a new virtio network device with the given TAP interface.
@@ -452,7 +448,7 @@ impl Net {
         let mtu = taps[0].mtu().map_err(Error::TapError)? as u16;
 
         let (avail_features, acked_features, config, queue_sizes) = if let Some(state) = state {
-            info!("Restoring virtio-net {}", id);
+            debug!("Restoring virtio-net {}", id);
             (
                 state.avail_features,
                 state.acked_features,
@@ -842,7 +838,7 @@ impl Snapshottable for Net {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        Snapshot::new_from_state(&self.id, &self.state())
     }
 }
 impl Transportable for Net {}
