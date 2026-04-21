@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use super::{register_listener, unregister_listener, vnet_hdr_len, Tap};
-use crate::GuestMemoryMmap;
-use rate_limiter::{RateLimiter, TokenType};
+use rate_limiter::{BucketReduction, RateLimiter, TokenType};
 use std::io;
 use std::num::Wrapping;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -12,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
+use vm_memory::bitmap::Bitmap;
 use vm_memory::{Bytes, GuestMemory};
 use vm_virtio::{AccessPlatform, Translatable};
 
@@ -19,6 +19,8 @@ use vm_virtio::{AccessPlatform, Translatable};
 pub struct TxVirtio {
     pub counter_bytes: Wrapping<u64>,
     pub counter_frames: Wrapping<u64>,
+    pub limit_bytes: Wrapping<u64>,
+    pub limit_frames: Wrapping<u64>,
 }
 
 impl Default for TxVirtio {
@@ -32,24 +34,33 @@ impl TxVirtio {
         TxVirtio {
             counter_bytes: Wrapping(0),
             counter_frames: Wrapping(0),
+            limit_bytes: Wrapping(0),
+            limit_frames: Wrapping(0),
         }
     }
 
-    pub fn process_desc_chain(
+    pub fn process_desc_chain<B: Bitmap + 'static>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &vm_memory::GuestMemoryMmap<B>,
         tap: &mut Tap,
         queue: &mut Queue,
         rate_limiter: &mut Option<RateLimiter>,
         access_platform: Option<&Arc<dyn AccessPlatform>>,
+        rate_limited: &mut std::sync::Once,
     ) -> Result<bool, NetQueuePairError> {
         let mut retry_write = false;
-        let mut rate_limit_reached = false;
+        let mut rate_limit_reached = BucketReduction::Success;
 
         while let Some(mut desc_chain) = queue.pop_descriptor_chain(mem) {
-            if rate_limit_reached {
-                queue.go_to_previous_position();
-                break;
+            match rate_limit_reached {
+                BucketReduction::Failure => {
+                    queue.go_to_previous_position();
+                    break;
+                }
+                BucketReduction::OverConsumption(_r) => {
+                    break;
+                }
+                BucketReduction::Success => {}
             }
 
             let mut next_desc = desc_chain.next();
@@ -64,9 +75,9 @@ impl TxVirtio {
                         .memory()
                         .get_slice(desc_addr, desc.len() as usize)
                         .map_err(NetQueuePairError::GuestMemory)?
-                        .as_ptr();
+                        .ptr_guard_mut();
                     let iovec = libc::iovec {
-                        iov_base: buf as *mut libc::c_void,
+                        iov_base: buf.as_ptr() as *mut libc::c_void,
                         iov_len: desc.len() as libc::size_t,
                     };
                     iovecs.push(iovec);
@@ -86,7 +97,7 @@ impl TxVirtio {
                 let result = unsafe {
                     libc::writev(
                         tap.as_raw_fd() as libc::c_int,
-                        iovecs.as_ptr() as *const libc::iovec,
+                        iovecs.as_ptr(),
                         iovecs.len() as libc::c_int,
                     )
                 };
@@ -116,8 +127,21 @@ impl TxVirtio {
             // let the 'last' descriptor chain go-through even if it was over the rate
             // limit, and simply stop processing oncoming `avail_desc` if any.
             if let Some(rate_limiter) = rate_limiter {
-                rate_limit_reached = !rate_limiter.consume(1, TokenType::Ops)
-                    || !rate_limiter.consume(len as u64, TokenType::Bytes);
+                rate_limit_reached = rate_limiter.consume(1, TokenType::Ops);
+                if rate_limit_reached != BucketReduction::Success {
+                    self.limit_frames += Wrapping(1);
+                    rate_limited.call_once(||{
+                        info!("net tx ops ratelimit fired")
+                    });
+                } else {
+                    rate_limit_reached = rate_limiter.consume(len as u64, TokenType::Bytes);
+                    if rate_limit_reached != BucketReduction::Success {
+                        self.limit_bytes += Wrapping(1);
+                        rate_limited.call_once(||{
+                            info!("net tx bw ratelimit fired")
+                        });
+                    }
+                }
             }
 
             queue
@@ -140,6 +164,8 @@ impl TxVirtio {
 pub struct RxVirtio {
     pub counter_bytes: Wrapping<u64>,
     pub counter_frames: Wrapping<u64>,
+    pub limit_bytes: Wrapping<u64>,
+    pub limit_frames: Wrapping<u64>,
 }
 
 impl Default for RxVirtio {
@@ -153,25 +179,34 @@ impl RxVirtio {
         RxVirtio {
             counter_bytes: Wrapping(0),
             counter_frames: Wrapping(0),
+            limit_bytes: Wrapping(0),
+            limit_frames: Wrapping(0),
         }
     }
 
-    pub fn process_desc_chain(
+    pub fn process_desc_chain<B: Bitmap + 'static>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &vm_memory::GuestMemoryMmap<B>,
         tap: &mut Tap,
         queue: &mut Queue,
         rate_limiter: &mut Option<RateLimiter>,
         access_platform: Option<&Arc<dyn AccessPlatform>>,
+        rate_limited: &mut std::sync::Once,
     ) -> Result<bool, NetQueuePairError> {
         let mut exhausted_descs = true;
-        let mut rate_limit_reached = false;
+        let mut rate_limit_reached = BucketReduction::Success;
 
         while let Some(mut desc_chain) = queue.pop_descriptor_chain(mem) {
-            if rate_limit_reached {
-                exhausted_descs = false;
-                queue.go_to_previous_position();
-                break;
+            match rate_limit_reached {
+                BucketReduction::Failure => {
+                    exhausted_descs = false;
+                    queue.go_to_previous_position();
+                    break;
+                }
+                BucketReduction::OverConsumption(_r) => {
+                    break;
+                }
+                BucketReduction::Success => {}
             }
 
             let desc = desc_chain
@@ -198,9 +233,9 @@ impl RxVirtio {
                         .memory()
                         .get_slice(desc_addr, desc.len() as usize)
                         .map_err(NetQueuePairError::GuestMemory)?
-                        .as_ptr();
+                        .ptr_guard_mut();
                     let iovec = libc::iovec {
-                        iov_base: buf as *mut libc::c_void,
+                        iov_base: buf.as_ptr() as *mut libc::c_void,
                         iov_len: desc.len() as libc::size_t,
                     };
                     iovecs.push(iovec);
@@ -220,7 +255,7 @@ impl RxVirtio {
                 let result = unsafe {
                     libc::readv(
                         tap.as_raw_fd() as libc::c_int,
-                        iovecs.as_ptr() as *const libc::iovec,
+                        iovecs.as_ptr(),
                         iovecs.len() as libc::c_int,
                     )
                 };
@@ -258,8 +293,21 @@ impl RxVirtio {
             // chain go-through even if it was over the rate limit, and simply stop
             // processing oncoming `avail_desc` if any.
             if let Some(rate_limiter) = rate_limiter {
-                rate_limit_reached = !rate_limiter.consume(1, TokenType::Ops)
-                    || !rate_limiter.consume(len as u64, TokenType::Bytes);
+                rate_limit_reached = rate_limiter.consume(1, TokenType::Ops);
+                if rate_limit_reached != BucketReduction::Success {
+                    self.limit_frames += Wrapping(1);
+                    rate_limited.call_once(||{
+                        info!("net rx ops ratelimit fired")
+                    });
+                } else {
+                    rate_limit_reached = rate_limiter.consume(len as u64, TokenType::Bytes);
+                    if rate_limit_reached != BucketReduction::Success {
+                        self.limit_bytes += Wrapping(1);
+                        rate_limited.call_once(||{
+                            info!("net rx bw ratelimit fired")
+                        });
+                    }
+                }
             }
 
             queue
@@ -284,6 +332,10 @@ pub struct NetCounters {
     pub tx_frames: Arc<AtomicU64>,
     pub rx_bytes: Arc<AtomicU64>,
     pub rx_frames: Arc<AtomicU64>,
+    pub rx_limit_bytes: Arc<AtomicU64>,
+    pub rx_limit_frames: Arc<AtomicU64>,
+    pub tx_limit_bytes: Arc<AtomicU64>,
+    pub tx_limit_frames: Arc<AtomicU64>,
 }
 
 #[derive(Error, Debug)]
@@ -333,12 +385,15 @@ pub struct NetQueuePair {
     pub rx_rate_limiter: Option<RateLimiter>,
     pub tx_rate_limiter: Option<RateLimiter>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
+    pub tx_rate_limited: std::sync::Once,
+    pub rx_rate_limited: std::sync::Once,
+    pub id: String,
 }
 
 impl NetQueuePair {
-    pub fn process_tx(
+    pub fn process_tx<B: Bitmap + 'static>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &vm_memory::GuestMemoryMmap<B>,
         queue: &mut Queue,
     ) -> Result<bool, NetQueuePairError> {
         let tx_tap_retry = self.tx.process_desc_chain(
@@ -347,6 +402,7 @@ impl NetQueuePair {
             queue,
             &mut self.tx_rate_limiter,
             self.access_platform.as_ref(),
+            &mut self.tx_rate_limited,
         )?;
 
         // We got told to try again when writing to the tap. Wait for the TAP to be writable
@@ -378,17 +434,25 @@ impl NetQueuePair {
         self.counters
             .tx_frames
             .fetch_add(self.tx.counter_frames.0, Ordering::AcqRel);
+        self.counters
+            .tx_limit_bytes
+            .fetch_add(self.tx.limit_bytes.0, Ordering::AcqRel);
+        self.counters
+            .tx_limit_frames
+            .fetch_add(self.tx.limit_frames.0, Ordering::AcqRel);
         self.tx.counter_bytes = Wrapping(0);
         self.tx.counter_frames = Wrapping(0);
+        self.tx.limit_bytes = Wrapping(0);
+        self.tx.limit_frames = Wrapping(0);
 
         queue
             .needs_notification(mem)
             .map_err(NetQueuePairError::QueueNeedsNotification)
     }
 
-    pub fn process_rx(
+    pub fn process_rx<B: Bitmap + 'static>(
         &mut self,
-        mem: &GuestMemoryMmap,
+        mem: &vm_memory::GuestMemoryMmap<B>,
         queue: &mut Queue,
     ) -> Result<bool, NetQueuePairError> {
         self.rx_desc_avail = !self.rx.process_desc_chain(
@@ -397,6 +461,7 @@ impl NetQueuePair {
             queue,
             &mut self.rx_rate_limiter,
             self.access_platform.as_ref(),
+            &mut self.rx_rate_limited,
         )?;
         let rate_limit_reached = self
             .rx_rate_limiter
@@ -423,8 +488,16 @@ impl NetQueuePair {
         self.counters
             .rx_frames
             .fetch_add(self.rx.counter_frames.0, Ordering::AcqRel);
+        self.counters
+            .rx_limit_bytes
+            .fetch_add(self.rx.limit_bytes.0, Ordering::AcqRel);
+        self.counters
+            .rx_limit_frames
+            .fetch_add(self.rx.limit_frames.0, Ordering::AcqRel);
         self.rx.counter_bytes = Wrapping(0);
         self.rx.counter_frames = Wrapping(0);
+        self.rx.limit_bytes = Wrapping(0);
+        self.rx.limit_frames = Wrapping(0);
 
         queue
             .needs_notification(mem)

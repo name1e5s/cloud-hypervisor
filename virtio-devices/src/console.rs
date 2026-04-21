@@ -14,6 +14,7 @@ use crate::VirtioInterrupt;
 use anyhow::anyhow;
 use libc::{EFD_NONBLOCK, TIOCGWINSZ};
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use serial_buffer::SerialBuffer;
 use std::cmp;
 use std::collections::VecDeque;
@@ -25,11 +26,8 @@ use std::result;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use thiserror::Error;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic};
-use vm_migration::VersionMapped;
+use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::{AccessPlatform, Translatable};
 use vmm_sys_util::eventfd::EventFd;
@@ -59,13 +57,15 @@ enum Error {
     GuestMemoryRead(vm_memory::guest_memory::Error),
     #[error("Failed to write to guest memory: {0}")]
     GuestMemoryWrite(vm_memory::guest_memory::Error),
+    #[error("Failed to write_all output: {0}")]
+    OutputWriteAll(io::Error),
     #[error("Failed to flush output: {0}")]
     OutputFlush(io::Error),
     #[error("Failed to add used index: {0}")]
     QueueAddUsed(virtio_queue::Error),
 }
 
-#[derive(Copy, Clone, Debug, Versionize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 #[repr(C, packed)]
 pub struct VirtioConsoleConfig {
     cols: u16,
@@ -264,15 +264,18 @@ impl ConsoleEpollHandler {
         while let Some(mut desc_chain) = trans_queue.pop_descriptor_chain(self.mem.memory()) {
             let desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
             if let Some(out) = &mut self.out {
+                let mut buf: Vec<u8> = Vec::new();
                 desc_chain
                     .memory()
-                    .write_to(
+                    .write_volatile_to(
                         desc.addr()
                             .translate_gva(self.access_platform.as_ref(), desc.len() as usize),
-                        out,
+                        &mut buf,
                         desc.len() as usize,
                     )
                     .map_err(Error::GuestMemoryRead)?;
+
+                out.write_all(&buf).map_err(Error::OutputWriteAll)?;
                 out.flush().map_err(Error::OutputFlush)?;
             }
             trans_queue
@@ -588,7 +591,7 @@ pub struct Console {
     exit_evt: EventFd,
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 pub struct ConsoleState {
     avail_features: u64,
     acked_features: u64,
@@ -613,9 +616,6 @@ fn get_win_size(tty: &dyn AsRawFd) -> (u16, u16) {
 
     (ws.cols, ws.rows)
 }
-
-impl VersionMapped for ConsoleState {}
-
 impl Console {
     /// Create a new virtio console device
     pub fn new(
@@ -814,7 +814,7 @@ impl Snapshottable for Console {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        Snapshot::new_from_state(&self.id, &self.state())
     }
 }
 impl Transportable for Console {}

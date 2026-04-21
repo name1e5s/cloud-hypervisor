@@ -50,6 +50,8 @@ pub enum Error {
     UnixRead(std::io::Error),
     /// Muxer connection limit reached.
     TooManyConnections,
+    /// Error parsing vsock dbg config.
+    ParseDbgConf,
 }
 
 type Result<T> = std::result::Result<T, Error>;

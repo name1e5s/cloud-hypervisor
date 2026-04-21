@@ -65,7 +65,7 @@ impl BusDevice for Cmos {
             INDEX_OFFSET => self.index = data[0],
             DATA_OFFSET => {
                 if self.index == 0x8f && data[0] == 0 {
-                    info!("CMOS reset");
+                    error!("Shutdown because of CMOS reset");
                     self.reset_evt.write(1).unwrap();
                 } else {
                     self.data[(self.index & INDEX_MASK) as usize] = data[0]

@@ -40,22 +40,19 @@ use crate::{
 use anyhow::anyhow;
 use byteorder::{ByteOrder, LittleEndian};
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use std::io;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::result;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, RwLock};
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use virtio_queue::Queue;
 use virtio_queue::QueueOwnedT;
 use virtio_queue::QueueT;
 use vm_memory::GuestAddressSpace;
 use vm_memory::GuestMemoryAtomic;
-use vm_migration::{
-    Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, VersionMapped,
-};
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -71,6 +68,8 @@ pub const TX_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 pub const EVT_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
 // Notification coming from the backend.
 pub const BACKEND_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
+// Host sock no-nested event
+pub const MUXER_EPOLL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 20;
 
 /// The `VsockEpollHandler` implements the runtime logic of our vsock device:
 /// 1. Respond to TX queue events by wrapping virtio buffers into `VsockPacket`s, then sending those
@@ -212,7 +211,22 @@ where
         helper.add_event(self.queue_evts[0].as_raw_fd(), RX_QUEUE_EVENT)?;
         helper.add_event(self.queue_evts[1].as_raw_fd(), TX_QUEUE_EVENT)?;
         helper.add_event(self.queue_evts[2].as_raw_fd(), EVT_QUEUE_EVENT)?;
-        helper.add_event(self.backend.read().unwrap().get_polled_fd(), BACKEND_EVENT)?;
+
+        let muxer_epoll_nested = self.backend.read().unwrap().muxer_epoll_nested();
+        if muxer_epoll_nested {
+            helper.add_event(self.backend.read().unwrap().get_polled_fd(), BACKEND_EVENT)?;
+        } else {
+            self.backend
+                .write()
+                .unwrap()
+                .set_epoll_helper_fd(helper.as_raw_fd());
+            info!(
+                "add host sock to eventpoll fd {} to listener...",
+                helper.as_raw_fd()
+            );
+            self.backend.write().unwrap().add_host_sock();
+        }
+
         helper.run(paused, paused_sync, self)?;
 
         Ok(())
@@ -301,9 +315,30 @@ where
                     })?;
                 }
             }
+            MUXER_EPOLL_EVENT => {
+                debug!("vsock: nested event");
+                let fd = (event.data >> 32) as RawFd;
+                self.backend
+                    .write()
+                    .unwrap()
+                    .dispatch_muxer_event(fd, evset);
+
+                self.process_tx().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to process TX queue: {:?}", e))
+                })?;
+                if self.backend.read().unwrap().has_pending_rx() {
+                    self.process_rx().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process RX queue: {:?}",
+                            e
+                        ))
+                    })?;
+                }
+            }
             _ => {
                 return Err(EpollHelperError::HandleEvent(anyhow!(
-                    "Unknown event for virtio-vsock"
+                    "Unknown event for virtio-vsock {}",
+                    ev_type
                 )));
             }
         }
@@ -323,13 +358,11 @@ pub struct Vsock<B: VsockBackend> {
     exit_evt: EventFd,
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 pub struct VsockState {
     pub avail_features: u64,
     pub acked_features: u64,
 }
-
-impl VersionMapped for VsockState {}
 
 impl<B> Vsock<B>
 where
@@ -349,7 +382,7 @@ where
         state: Option<VsockState>,
     ) -> io::Result<Vsock<B>> {
         let (avail_features, acked_features) = if let Some(state) = state {
-            info!("Restoring virtio-vsock {}", id);
+            debug!("Restoring virtio-vsock {}", id);
             (state.avail_features, state.acked_features)
         } else {
             let mut avail_features = 1u64 << VIRTIO_F_VERSION_1 | 1u64 << VIRTIO_F_IN_ORDER;
@@ -517,7 +550,9 @@ where
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        let mut snapshot = Snapshot::new_from_state(&self.id, &self.state())?;
+        snapshot.add_snapshot(self.backend.write().unwrap().snapshot()?);
+        Ok(snapshot)
     }
 }
 impl<B> Transportable for Vsock<B> where B: VsockBackend + Sync + 'static {}

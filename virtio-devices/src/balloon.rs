@@ -20,22 +20,19 @@ use crate::{
 };
 use anyhow::anyhow;
 use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::result;
 use std::sync::{atomic::AtomicBool, Arc, Barrier};
 use thiserror::Error;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
     GuestMemoryError, GuestMemoryRegion,
 };
-use vm_migration::{
-    Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, VersionMapped,
-};
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
 const QUEUE_SIZE: u16 = 128;
@@ -86,7 +83,7 @@ pub enum Error {
 
 // Got from include/uapi/linux/virtio_balloon.h
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Versionize)]
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VirtioBalloonConfig {
     // Number of pages host wants Guest to give up.
     num_pages: u32,
@@ -332,14 +329,12 @@ impl EpollHelperHandler for BalloonEpollHandler {
     }
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 pub struct BalloonState {
     pub avail_features: u64,
     pub acked_features: u64,
     pub config: VirtioBalloonConfig,
 }
-
-impl VersionMapped for BalloonState {}
 
 // Virtio device for exposing entropy to the guest OS through virtio.
 pub struct Balloon {
@@ -578,7 +573,7 @@ impl Snapshottable for Balloon {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id(), &self.state())
+        Snapshot::new_from_state(&self.id(), &self.state())
     }
 }
 impl Transportable for Balloon {}

@@ -449,20 +449,24 @@ where
             let flushed = self
                 .tx_buf
                 .flush_to(&mut self.stream)
-                .unwrap_or_else(|err| {
-                    warn!(
-                        "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
-                        self.local_port, self.peer_port, err
-                    );
-                    match err {
-                        Error::TxBufFlush(inner) if inner.kind() == ErrorKind::WouldBlock => {
-                            // This should never happen (EWOULDBLOCK after EPOLLOUT), but
-                            // it does, so let's absorb it.
-                        }
-                        _ => self.kill(),
-                    };
-                    0
+                .unwrap_or_else(|err| match err {
+                    Error::TxBufFlush(inner) if inner.kind() == ErrorKind::WouldBlock => {
+                        debug!(
+                            "vsock: unexpected EWOULDBLOCK while flushing TX buf (lp={}, pp={})",
+                            self.local_port, self.peer_port
+                        );
+                        0
+                    }
+                    _ => {
+                        warn!(
+                            "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
+                            self.local_port, self.peer_port, err
+                        );
+                        self.kill();
+                        0
+                    }
                 });
+
             self.fwd_cnt += Wrapping(flushed as u32);
 
             // If this connection was shutting down, but is waiting to drain the TX buffer
@@ -606,9 +610,13 @@ where
         let written = match self.stream.write(buf) {
             Ok(cnt) => cnt,
             Err(e) => {
-                // Absorb any would-block errors, since we can always try again later.
+                // For WouldBlock error, we should put data into buffer
                 if e.kind() == ErrorKind::WouldBlock {
-                    0
+                    debug!(
+                        "vsock: stream write would block (lp={}, pp={}), buffering data",
+                        self.local_port, self.peer_port
+                    );
+                    return self.tx_buf.push(buf);
                 } else {
                     // We don't know how to handle any other write error, so we'll send it up
                     // the call chain.
