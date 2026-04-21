@@ -12,6 +12,7 @@ use crate::{
 use anyhow::anyhow;
 use byteorder::{ByteOrder, LittleEndian};
 use hypervisor::HypervisorVmError;
+use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -19,8 +20,6 @@ use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
 use std::sync::{Arc, Barrier, Mutex};
 use thiserror::Error;
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use vfio_bindings::bindings::vfio::*;
 use vfio_ioctls::{
     VfioContainer, VfioDevice, VfioIrq, VfioRegionInfoCap, VfioRegionSparseMmapArea,
@@ -31,9 +30,7 @@ use vm_device::interrupt::{
 };
 use vm_device::{BusDevice, Resource};
 use vm_memory::{Address, GuestAddress, GuestUsize};
-use vm_migration::{
-    Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, VersionMapped,
-};
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
 #[derive(Debug, Error)]
@@ -78,7 +75,7 @@ enum InterruptUpdateAction {
     DisableMsix,
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 struct IntxState {
     enabled: bool,
 }
@@ -88,7 +85,7 @@ pub(crate) struct VfioIntx {
     enabled: bool,
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 struct MsiState {
     cap: MsiCap,
     cap_offset: u32,
@@ -120,7 +117,7 @@ impl VfioMsi {
     }
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 struct MsixState {
     cap: MsixCap,
     cap_offset: u32,
@@ -381,14 +378,12 @@ impl Vfio for VfioDeviceWrapper {
     }
 }
 
-#[derive(Versionize)]
+#[derive(Serialize, Deserialize)]
 struct VfioCommonState {
     intx_state: Option<IntxState>,
     msi_state: Option<MsiState>,
     msix_state: Option<MsixState>,
 }
-
-impl VersionMapped for VfioCommonState {}
 
 pub(crate) struct ConfigPatch {
     mask: u32,
@@ -1125,8 +1120,7 @@ impl Snapshottable for VfioCommon {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        let mut vfio_common_snapshot =
-            Snapshot::new_from_versioned_state(&self.id(), &self.state())?;
+        let mut vfio_common_snapshot = Snapshot::new_from_state(&self.id(), &self.state())?;
 
         // Snapshot PciConfiguration
         vfio_common_snapshot.add_snapshot(self.configuration.snapshot()?);
@@ -1151,7 +1145,7 @@ impl Snapshottable for VfioCommon {
         {
             // It has to be invoked first as we want Interrupt to be initialized
             // correctly before we try to restore MSI and MSI-X configurations.
-            self.set_state(&vfio_common_section.to_versioned_state()?)
+            self.set_state(&vfio_common_section.to_state()?)
                 .map_err(|e| {
                     MigratableError::Restore(anyhow!("Could not restore VFIO_COMMON state {:?}", e))
                 })?;

@@ -38,7 +38,6 @@ use std::os::unix::io::RawFd;
 use std::result;
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_arch = "aarch64")]
 use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
 use vmm_sys_util::eventfd::EventFd;
@@ -47,7 +46,7 @@ use vmm_sys_util::eventfd::EventFd;
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::{
-    CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, StandardRegisters,
+    CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, StandardRegisters, XsaveState,
     NUM_IOAPIC_PINS,
 };
 #[cfg(target_arch = "x86_64")]
@@ -66,18 +65,18 @@ use kvm_bindings::{
 #[cfg(target_arch = "x86_64")]
 use x86_64::check_required_kvm_extensions;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{CpuId, ExtendedControlRegisters, MsrEntries, VcpuKvmState, Xsave};
+pub use x86_64::{CpuId, ExtendedControlRegisters, MsrEntries, VcpuKvmState};
 // aarch64 dependencies
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 pub use kvm_bindings;
 #[cfg(feature = "tdx")]
-use kvm_bindings::KVMIO;
+pub use kvm_bindings::kvm_run__bindgen_ty_1;
 pub use kvm_bindings::{
     kvm_clock_data, kvm_create_device, kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug,
-    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_userspace_memory_region,
-    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI,
-    KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY, KVM_MSI_VALID_DEVID,
+    kvm_irq_routing, kvm_irq_routing_entry, kvm_irqfd, kvm_mp_state, kvm_userspace_memory_region,
+    KVMIO, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_IRQ_ROUTING_IRQCHIP,
+    KVM_IRQ_ROUTING_MSI, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY, KVM_MSI_VALID_DEVID,
 };
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
@@ -167,6 +166,52 @@ pub struct TdxCapabilities {
     pub nr_cpuid_configs: u32,
     pub padding: u32,
     pub cpuid_configs: [TdxCpuidConfig; TDX_MAX_NR_CPUID_CONFIGS],
+}
+
+#[cfg(feature = "tdx")]
+#[derive(Copy, Clone)]
+pub struct KvmTdxExit {
+    pub type_: u32,
+    pub pad: u32,
+    pub u: KvmTdxExitU,
+}
+
+#[cfg(feature = "tdx")]
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union KvmTdxExitU {
+    pub vmcall: KvmTdxExitVmcall,
+}
+
+#[cfg(feature = "tdx")]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
+pub struct KvmTdxExitVmcall {
+    pub type_: u64,
+    pub subfunction: u64,
+    pub reg_mask: u64,
+    pub in_r12: u64,
+    pub in_r13: u64,
+    pub in_r14: u64,
+    pub in_r15: u64,
+    pub in_rbx: u64,
+    pub in_rdi: u64,
+    pub in_rsi: u64,
+    pub in_r8: u64,
+    pub in_r9: u64,
+    pub in_rdx: u64,
+    pub status_code: u64,
+    pub out_r11: u64,
+    pub out_r12: u64,
+    pub out_r13: u64,
+    pub out_r14: u64,
+    pub out_r15: u64,
+    pub out_rbx: u64,
+    pub out_rdi: u64,
+    pub out_rsi: u64,
+    pub out_r8: u64,
+    pub out_r9: u64,
+    pub out_rdx: u64,
 }
 
 impl From<kvm_userspace_memory_region> for UserMemoryRegion {
@@ -396,12 +441,12 @@ impl vm::Vm for KvmVm {
         id: u8,
         vm_ops: Option<Arc<dyn VmOps>>,
     ) -> vm::Result<Arc<dyn cpu::Vcpu>> {
-        let vc = self
+        let fd = self
             .fd
             .create_vcpu(id as u64)
             .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
         let vcpu = KvmVcpu {
-            fd: vc,
+            fd: Arc::new(Mutex::new(fd)),
             #[cfg(target_arch = "x86_64")]
             msrs: self.msrs.clone(),
             vm_ops,
@@ -869,6 +914,7 @@ fn tdx_command(
 /// Wrapper over KVM system ioctls.
 pub struct KvmHypervisor {
     kvm: Kvm,
+    hypervisor_type: HypervisorType,
 }
 
 impl KvmHypervisor {
@@ -901,7 +947,21 @@ impl KvmHypervisor {
             return Err(hypervisor::HypervisorError::IncompatibleApiVersion);
         }
 
-        Ok(Arc::new(KvmHypervisor { kvm: kvm_obj }))
+        let mut hypervisor_type = HypervisorType::Kvm;
+
+        #[cfg(target_arch = "x86_64")]
+        if let Ok(cpuid) = kvm_obj.get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES) {
+            for entry in cpuid.as_slice().iter() {
+                if entry.function == 0x4000_0002 && entry.ebx == 0x4d_5650 {
+                    hypervisor_type = HypervisorType::KvmPvm;
+                }
+            }
+        }
+
+        Ok(Arc::new(KvmHypervisor {
+            kvm: kvm_obj,
+            hypervisor_type,
+        }))
     }
     /// Check if the hypervisor is available
     pub fn is_available() -> hypervisor::Result<bool> {
@@ -927,8 +987,9 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     /// Returns the type of the hypervisor
     ///
     fn hypervisor_type(&self) -> HypervisorType {
-        HypervisorType::Kvm
+        self.hypervisor_type
     }
+
     /// Create a KVM vm object of a specific VM type and return the object as Vm trait object
     /// Example
     /// # extern crate hypervisor;
@@ -1077,7 +1138,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 }
 /// Vcpu struct for KVM
 pub struct KvmVcpu {
-    fd: VcpuFd,
+    fd: Arc<Mutex<VcpuFd>>,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
     vm_ops: Option<Arc<dyn vm::VmOps>>,
@@ -1102,6 +1163,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn get_regs(&self) -> cpu::Result<StandardRegisters> {
         Ok(self
             .fd
+            .lock()
+            .unwrap()
             .get_regs()
             .map_err(|e| cpu::HypervisorCpuError::GetStandardRegs(e.into()))?
             .into())
@@ -1120,102 +1183,115 @@ impl cpu::Vcpu for KvmVcpu {
         // These actually are the general-purpose registers of the Armv8-a
         // architecture (i.e x0-x30 if used as a 64bit register or w0-30 when used as a 32bit register).
         for i in 0..31 {
-            state.regs.regs[i] = self
-                .fd
-                .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off))
-                .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?
-                .try_into()
-                .unwrap();
+            let mut bytes = [0_u8; 8];
+            self.fd
+                .lock()
+                .unwrap()
+                .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
+                .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            state.regs.regs[i] = u64::from_le_bytes(bytes);
             off += std::mem::size_of::<u64>();
         }
 
         // We are now entering the "Other register" section of the ARMv8-a architecture.
         // First one, stack pointer.
-        let off = offset__of!(user_pt_regs, sp);
-        state.regs.sp = self
-            .fd
-            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off))
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?
-            .try_into()
-            .unwrap();
+        let off = offset_of!(user_pt_regs, sp);
+        let mut bytes = [0_u8; 8];
+        self.fd
+            .lock()
+            .unwrap()
+            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
+            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+        state.regs.sp = u64::from_le_bytes(bytes);
 
         // Second one, the program counter.
-        let off = offset__of!(user_pt_regs, pc);
-        state.regs.pc = self
-            .fd
-            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off))
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?
-            .try_into()
-            .unwrap();
+        let off = offset_of!(user_pt_regs, pc);
+        let mut bytes = [0_u8; 8];
+        self.fd
+            .lock()
+            .unwrap()
+            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
+            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+        state.regs.pc = u64::from_le_bytes(bytes);
 
         // Next is the processor state.
-        let off = offset__of!(user_pt_regs, pstate);
+        let off = offset_of!(user_pt_regs, pstate);
         state.regs.pstate = self
             .fd
+            .lock()
+            .unwrap()
             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off))
             .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?
             .try_into()
             .unwrap();
 
         // The stack pointer associated with EL1
-        let off = offset__of!(kvm_regs, sp_el1);
-        state.sp_el1 = self
-            .fd
-            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off))
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?
-            .try_into()
-            .unwrap();
+        let off = offset_of!(kvm_regs, sp_el1);
+        let mut bytes = [0_u8; 8];
+        self.fd
+            .lock()
+            .unwrap()
+            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
+            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+        state.sp_el1 = u64::from_le_bytes(bytes);
 
         // Exception Link Register for EL1, when taking an exception to EL1, this register
         // holds the address to which to return afterwards.
-        let off = offset__of!(kvm_regs, elr_el1);
-        state.elr_el1 = self
-            .fd
-            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off))
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?
-            .try_into()
-            .unwrap();
+        let off = offset_of!(kvm_regs, elr_el1);
+        let mut bytes = [0_u8; 8];
+        self.fd
+            .lock()
+            .unwrap()
+            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
+            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+        state.elr_el1 = u64::from_le_bytes(bytes);
 
         // Saved Program Status Registers, there are 5 of them used in the kernel.
-        let mut off = offset__of!(kvm_regs, spsr);
+        let mut off = offset_of!(kvm_regs, spsr);
         for i in 0..KVM_NR_SPSR as usize {
-            state.spsr[i] = self
-                .fd
-                .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off))
-                .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?
-                .try_into()
-                .unwrap();
+            let mut bytes = [0_u8; 8];
+            self.fd
+                .lock()
+                .unwrap()
+                .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
+                .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            state.spsr[i] = u64::from_le_bytes(bytes);
             off += std::mem::size_of::<u64>();
         }
 
-        // Now moving on to floting point registers which are stored in the user_fpsimd_state in the kernel:
+        // Now moving on to floating point registers which are stored in the user_fpsimd_state in the kernel:
         // https://elixir.free-electrons.com/linux/v4.9.62/source/arch/arm64/include/uapi/asm/kvm.h#L53
-        let mut off = offset__of!(kvm_regs, fp_regs) + offset__of!(user_fpsimd_state, vregs);
+        let mut off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, vregs);
         for i in 0..32 {
-            state.fp_regs.vregs[i] = self
-                .fd
-                .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U128, off))
+            let mut bytes = [0_u8; 16];
+            self.fd
+                .lock()
+                .unwrap()
+                .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U128, off), &mut bytes)
                 .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            state.fp_regs.vregs[i] = u128::from_le_bytes(bytes);
             off += mem::size_of::<u128>();
         }
 
         // Floating-point Status Register
-        let off = offset__of!(kvm_regs, fp_regs) + offset__of!(user_fpsimd_state, fpsr);
-        state.fp_regs.fpsr = self
-            .fd
-            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off))
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?
-            .try_into()
-            .unwrap();
+        let off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpsr);
+        let mut bytes = [0_u8; 4];
+        self.fd
+            .lock()
+            .unwrap()
+            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
+            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+        state.fp_regs.fpsr = u32::from_le_bytes(bytes);
 
         // Floating-point Control Register
-        let off = offset__of!(kvm_regs, fp_regs) + offset__of!(user_fpsimd_state, fpcr);
-        state.fp_regs.fpcr = self
-            .fd
-            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off))
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?
-            .try_into()
-            .unwrap();
+        let off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpcr);
+        let mut bytes = [0_u8; 4];
+        self.fd
+            .lock()
+            .unwrap()
+            .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
+            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+        state.fp_regs.fpcr = u32::from_le_bytes(bytes);
         Ok(state)
     }
     #[cfg(target_arch = "x86_64")]
@@ -1225,6 +1301,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn set_regs(&self, regs: &StandardRegisters) -> cpu::Result<()> {
         let regs = (*regs).into();
         self.fd
+            .lock()
+            .unwrap()
             .set_regs(&regs)
             .map_err(|e| cpu::HypervisorCpuError::SetStandardRegs(e.into()))
     }
@@ -1238,92 +1316,112 @@ impl cpu::Vcpu for KvmVcpu {
     fn set_regs(&self, state: &StandardRegisters) -> cpu::Result<()> {
         // The function follows the exact identical order from `state`. Look there
         // for some additional info on registers.
-        let mut off = offset__of!(user_pt_regs, regs);
+        let mut off = offset_of!(user_pt_regs, regs);
         for i in 0..31 {
             self.fd
+                .lock()
+                .unwrap()
                 .set_one_reg(
                     arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                    state.regs.regs[i].into(),
+                    &state.regs.regs[i].to_le_bytes(),
                 )
                 .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
             off += std::mem::size_of::<u64>();
         }
 
-        let off = offset__of!(user_pt_regs, sp);
+        let off = offset_of!(user_pt_regs, sp);
         self.fd
+            .lock()
+            .unwrap()
             .set_one_reg(
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                state.regs.sp.into(),
+                &state.regs.sp.to_le_bytes(),
             )
             .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
 
-        let off = offset__of!(user_pt_regs, pc);
+        let off = offset_of!(user_pt_regs, pc);
         self.fd
+            .lock()
+            .unwrap()
             .set_one_reg(
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                state.regs.pc.into(),
+                &state.regs.pc.to_le_bytes(),
             )
             .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
 
-        let off = offset__of!(user_pt_regs, pstate);
+        let off = offset_of!(user_pt_regs, pstate);
         self.fd
+            .lock()
+            .unwrap()
             .set_one_reg(
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                state.regs.pstate.into(),
+                &state.regs.pstate.to_le_bytes(),
             )
             .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
 
-        let off = offset__of!(kvm_regs, sp_el1);
+        let off = offset_of!(kvm_regs, sp_el1);
         self.fd
+            .lock()
+            .unwrap()
             .set_one_reg(
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                state.sp_el1.into(),
+                &state.sp_el1.to_le_bytes(),
             )
             .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
 
-        let off = offset__of!(kvm_regs, elr_el1);
+        let off = offset_of!(kvm_regs, elr_el1);
         self.fd
+            .lock()
+            .unwrap()
             .set_one_reg(
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                state.elr_el1.into(),
+                &state.elr_el1.to_le_bytes(),
             )
             .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
 
-        let mut off = offset__of!(kvm_regs, spsr);
+        let mut off = offset_of!(kvm_regs, spsr);
         for i in 0..KVM_NR_SPSR as usize {
             self.fd
+                .lock()
+                .unwrap()
                 .set_one_reg(
                     arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
-                    state.spsr[i].into(),
+                    &state.spsr[i].to_le_bytes(),
                 )
                 .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
             off += std::mem::size_of::<u64>();
         }
 
-        let mut off = offset__of!(kvm_regs, fp_regs) + offset__of!(user_fpsimd_state, vregs);
+        let mut off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, vregs);
         for i in 0..32 {
             self.fd
+                .lock()
+                .unwrap()
                 .set_one_reg(
                     arm64_core_reg_id!(KVM_REG_SIZE_U128, off),
-                    state.fp_regs.vregs[i],
+                    &state.fp_regs.vregs[i].to_le_bytes(),
                 )
                 .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
             off += mem::size_of::<u128>();
         }
 
-        let off = offset__of!(kvm_regs, fp_regs) + offset__of!(user_fpsimd_state, fpsr);
+        let off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpsr);
         self.fd
+            .lock()
+            .unwrap()
             .set_one_reg(
                 arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
-                state.fp_regs.fpsr.into(),
+                &state.fp_regs.fpsr.to_le_bytes(),
             )
             .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
 
-        let off = offset__of!(kvm_regs, fp_regs) + offset__of!(user_fpsimd_state, fpcr);
+        let off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpcr);
         self.fd
+            .lock()
+            .unwrap()
             .set_one_reg(
                 arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
-                state.fp_regs.fpcr.into(),
+                &state.fp_regs.fpcr.to_le_bytes(),
             )
             .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
         Ok(())
@@ -1336,6 +1434,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn get_sregs(&self) -> cpu::Result<SpecialRegisters> {
         Ok(self
             .fd
+            .lock()
+            .unwrap()
             .get_sregs()
             .map_err(|e| cpu::HypervisorCpuError::GetSpecialRegs(e.into()))?
             .into())
@@ -1347,6 +1447,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn set_sregs(&self, sregs: &SpecialRegisters) -> cpu::Result<()> {
         let sregs = (*sregs).into();
         self.fd
+            .lock()
+            .unwrap()
             .set_sregs(&sregs)
             .map_err(|e| cpu::HypervisorCpuError::SetSpecialRegs(e.into()))
     }
@@ -1357,6 +1459,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn get_fpu(&self) -> cpu::Result<FpuState> {
         Ok(self
             .fd
+            .lock()
+            .unwrap()
             .get_fpu()
             .map_err(|e| cpu::HypervisorCpuError::GetFloatingPointRegs(e.into()))?
             .into())
@@ -1368,6 +1472,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn set_fpu(&self, fpu: &FpuState) -> cpu::Result<()> {
         let fpu: kvm_bindings::kvm_fpu = (*fpu).clone().into();
         self.fd
+            .lock()
+            .unwrap()
             .set_fpu(&fpu)
             .map_err(|e| cpu::HypervisorCpuError::SetFloatingPointRegs(e.into()))
     }
@@ -1382,6 +1488,8 @@ impl cpu::Vcpu for KvmVcpu {
             .map_err(|_| cpu::HypervisorCpuError::SetCpuid(anyhow!("failed to create CpuId")))?;
 
         self.fd
+            .lock()
+            .unwrap()
             .set_cpuid2(&kvm_cpuid)
             .map_err(|e| cpu::HypervisorCpuError::SetCpuid(e.into()))
     }
@@ -1399,6 +1507,8 @@ impl cpu::Vcpu for KvmVcpu {
             ..Default::default()
         };
         self.fd
+            .lock()
+            .unwrap()
             .enable_cap(&cap)
             .map_err(|e| cpu::HypervisorCpuError::EnableHyperVSyncIc(e.into()))
     }
@@ -1409,6 +1519,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn get_cpuid2(&self, num_entries: usize) -> cpu::Result<Vec<CpuIdEntry>> {
         let kvm_cpuid = self
             .fd
+            .lock()
+            .unwrap()
             .get_cpuid2(num_entries)
             .map_err(|e| cpu::HypervisorCpuError::GetCpuid(e.into()))?;
 
@@ -1423,6 +1535,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn get_lapic(&self) -> cpu::Result<LapicState> {
         Ok(self
             .fd
+            .lock()
+            .unwrap()
             .get_lapic()
             .map_err(|e| cpu::HypervisorCpuError::GetlapicState(e.into()))?
             .into())
@@ -1434,6 +1548,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn set_lapic(&self, klapic: &LapicState) -> cpu::Result<()> {
         let klapic: kvm_bindings::kvm_lapic_state = (*klapic).clone().into();
         self.fd
+            .lock()
+            .unwrap()
             .set_lapic(&klapic)
             .map_err(|e| cpu::HypervisorCpuError::SetLapicState(e.into()))
     }
@@ -1446,6 +1562,8 @@ impl cpu::Vcpu for KvmVcpu {
         let mut kvm_msrs = MsrEntries::from_entries(&kvm_msrs).unwrap();
         let succ = self
             .fd
+            .lock()
+            .unwrap()
             .get_msrs(&mut kvm_msrs)
             .map_err(|e| cpu::HypervisorCpuError::GetMsrEntries(e.into()))?;
 
@@ -1467,6 +1585,8 @@ impl cpu::Vcpu for KvmVcpu {
         let kvm_msrs: Vec<kvm_msr_entry> = msrs.iter().map(|e| (*e).into()).collect();
         let kvm_msrs = MsrEntries::from_entries(&kvm_msrs).unwrap();
         self.fd
+            .lock()
+            .unwrap()
             .set_msrs(&kvm_msrs)
             .map_err(|e| cpu::HypervisorCpuError::SetMsrEntries(e.into()))
     }
@@ -1476,6 +1596,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn get_mp_state(&self) -> cpu::Result<MpState> {
         Ok(self
             .fd
+            .lock()
+            .unwrap()
             .get_mp_state()
             .map_err(|e| cpu::HypervisorCpuError::GetMpState(e.into()))?
             .into())
@@ -1485,6 +1607,8 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     fn set_mp_state(&self, mp_state: MpState) -> cpu::Result<()> {
         self.fd
+            .lock()
+            .unwrap()
             .set_mp_state(mp_state.into())
             .map_err(|e| cpu::HypervisorCpuError::SetMpState(e.into()))
     }
@@ -1495,6 +1619,8 @@ impl cpu::Vcpu for KvmVcpu {
     fn translate_gva(&self, gva: u64, _flags: u64) -> cpu::Result<(u64, u32)> {
         let tr = self
             .fd
+            .lock()
+            .unwrap()
             .translate_gva(gva)
             .map_err(|e| cpu::HypervisorCpuError::TranslateVirtualAddress(e.into()))?;
         // tr.valid is set if the GVA is mapped to valid GPA.
@@ -1510,7 +1636,7 @@ impl cpu::Vcpu for KvmVcpu {
     /// Triggers the running of the current virtual CPU returning an exit reason.
     ///
     fn run(&self) -> std::result::Result<cpu::VmExit, cpu::HypervisorCpuError> {
-        match self.fd.run() {
+        match self.fd.lock().unwrap().run() {
             Ok(run) => match run {
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoIn(addr, data) => {
@@ -1521,7 +1647,7 @@ impl cpu::Vcpu for KvmVcpu {
                             .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()));
                     }
 
-                    Ok(cpu::VmExit::IoIn(addr, data))
+                    Ok(cpu::VmExit::Ignore)
                 }
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoOut(addr, data) => {
@@ -1532,7 +1658,7 @@ impl cpu::Vcpu for KvmVcpu {
                             .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()));
                     }
 
-                    Ok(cpu::VmExit::IoOut(addr, data))
+                    Ok(cpu::VmExit::Ignore)
                 }
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoapicEoi(vector) => Ok(cpu::VmExit::IoapicEoi(vector)),
@@ -1550,7 +1676,7 @@ impl cpu::Vcpu for KvmVcpu {
                         Ok(cpu::VmExit::Shutdown)
                     } else {
                         Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
-                            "Unexpected system event with type 0x{:x}, flags 0x{:x}",
+                            "Unexpected system event with type 0x{:x}, flags 0x{:x?}",
                             event_type,
                             flags
                         )))
@@ -1565,7 +1691,7 @@ impl cpu::Vcpu for KvmVcpu {
                             .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()));
                     }
 
-                    Ok(cpu::VmExit::MmioRead(addr, data))
+                    Ok(cpu::VmExit::Ignore)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
                     if let Some(vm_ops) = &self.vm_ops {
@@ -1575,7 +1701,7 @@ impl cpu::Vcpu for KvmVcpu {
                             .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()));
                     }
 
-                    Ok(cpu::VmExit::MmioWrite(addr, data))
+                    Ok(cpu::VmExit::Ignore)
                 }
                 VcpuExit::Hyperv => Ok(cpu::VmExit::Hyperv),
                 #[cfg(feature = "tdx")]
@@ -1603,7 +1729,7 @@ impl cpu::Vcpu for KvmVcpu {
     /// potential soft lockups when being resumed.
     ///
     fn notify_guest_clock_paused(&self) -> cpu::Result<()> {
-        if let Err(e) = self.fd.kvmclock_ctrl() {
+        if let Err(e) = self.fd.lock().unwrap().kvmclock_ctrl() {
             // Linux kernel returns -EINVAL if the PV clock isn't yet initialised
             // which could be because we're still in firmware or the guest doesn't
             // use KVM clock.
@@ -1664,12 +1790,16 @@ impl cpu::Vcpu for KvmVcpu {
             }
         }
         self.fd
+            .lock()
+            .unwrap()
             .set_guest_debug(&dbg)
             .map_err(|e| cpu::HypervisorCpuError::SetDebugRegs(e.into()))
     }
     #[cfg(target_arch = "aarch64")]
     fn vcpu_init(&self, kvi: &VcpuInit) -> cpu::Result<()> {
         self.fd
+            .lock()
+            .unwrap()
             .vcpu_init(kvi)
             .map_err(|e| cpu::HypervisorCpuError::VcpuInit(e.into()))
     }
@@ -1680,6 +1810,8 @@ impl cpu::Vcpu for KvmVcpu {
     #[cfg(target_arch = "aarch64")]
     fn get_reg_list(&self, reg_list: &mut RegList) -> cpu::Result<()> {
         self.fd
+            .lock()
+            .unwrap()
             .get_reg_list(reg_list)
             .map_err(|e| cpu::HypervisorCpuError::GetRegList(e.into()))
     }
@@ -1709,12 +1841,13 @@ impl cpu::Vcpu for KvmVcpu {
                     | KVM_REG_ARM64_SYSREG_CRN_MASK
                     | KVM_REG_ARM64_SYSREG_CRM_MASK
                     | KVM_REG_ARM64_SYSREG_OP2_MASK)) as u64);
-        Ok(self
-            .fd
-            .get_one_reg(id)
-            .map_err(|e| cpu::HypervisorCpuError::GetSysRegister(e.into()))?
-            .try_into()
-            .unwrap())
+        let mut bytes = [0_u8; 8];
+        self.fd
+            .lock()
+            .unwrap()
+            .get_one_reg(id, &mut bytes)
+            .map_err(|e| cpu::HypervisorCpuError::GetSysRegister(e.into()))?;
+        Ok(u64::from_le_bytes(bytes))
     }
     ///
     /// Configure core registers for a given CPU.
@@ -1733,34 +1866,43 @@ impl cpu::Vcpu for KvmVcpu {
         const PSTATE_FAULT_BITS_64: u64 =
             PSR_MODE_EL1h | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
 
-        let kreg_off = offset__of!(kvm_regs, regs);
+        let kreg_off = offset_of!(kvm_regs, regs);
 
         // Get the register index of the PSTATE (Processor State) register.
-        let pstate = offset__of!(user_pt_regs, pstate) + kreg_off;
+        let pstate = offset_of!(user_pt_regs, pstate) + kreg_off;
         self.fd
+            .lock()
+            .unwrap()
             .set_one_reg(
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate),
-                PSTATE_FAULT_BITS_64.into(),
+                &PSTATE_FAULT_BITS_64.to_le_bytes(),
             )
             .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
 
         // Other vCPUs are powered off initially awaiting PSCI wakeup.
         if cpu_id == 0 {
             // Setting the PC (Processor Counter) to the current program address (kernel address).
-            let pc = offset__of!(user_pt_regs, pc) + kreg_off;
+            let pc = offset_of!(user_pt_regs, pc) + kreg_off;
             self.fd
-                .set_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, pc), boot_ip.into())
+                .lock()
+                .unwrap()
+                .set_one_reg(
+                    arm64_core_reg_id!(KVM_REG_SIZE_U64, pc),
+                    &boot_ip.to_le_bytes(),
+                )
                 .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
 
             // Last mandatory thing to set -> the address pointing to the FDT (also called DTB).
             // "The device tree blob (dtb) must be placed on an 8-byte boundary and must
             // not exceed 2 megabytes in size." -> https://www.kernel.org/doc/Documentation/arm64/booting.txt.
             // We are choosing to place it the end of DRAM. See `get_fdt_addr`.
-            let regs0 = offset__of!(user_pt_regs, regs) + kreg_off;
+            let regs0 = offset_of!(user_pt_regs, regs) + kreg_off;
             self.fd
+                .lock()
+                .unwrap()
                 .set_one_reg(
                     arm64_core_reg_id!(KVM_REG_SIZE_U64, regs0),
-                    fdt_start.into(),
+                    &fdt_start.to_le_bytes(),
                 )
                 .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
         }
@@ -1883,7 +2025,7 @@ impl cpu::Vcpu for KvmVcpu {
             sregs: sregs.into(),
             fpu,
             lapic_state,
-            xsave,
+            xsave: xsave.into(),
             xcrs,
             mp_state,
         }
@@ -1907,6 +2049,8 @@ impl cpu::Vcpu for KvmVcpu {
         let mut sys_regs: Vec<Register> = Vec::new();
         let mut reg_list = RegList::new(500).unwrap();
         self.fd
+            .lock()
+            .unwrap()
             .get_reg_list(&mut reg_list)
             .map_err(|e| cpu::HypervisorCpuError::GetRegList(e.into()))?;
 
@@ -1923,14 +2067,15 @@ impl cpu::Vcpu for KvmVcpu {
         // register list, we are simply calling KVM_GET_ONE_REG.
         let indices = reg_list.as_slice();
         for index in indices.iter() {
+            let mut bytes = [0_u8; 8];
+            self.fd
+                .lock()
+                .unwrap()
+                .get_one_reg(*index, &mut bytes)
+                .map_err(|e| cpu::HypervisorCpuError::GetSysRegister(e.into()))?;
             sys_regs.push(kvm_bindings::kvm_one_reg {
                 id: *index,
-                addr: self
-                    .fd
-                    .get_one_reg(*index)
-                    .map_err(|e| cpu::HypervisorCpuError::GetSysRegister(e.into()))?
-                    .try_into()
-                    .unwrap(),
+                addr: u64::from_le_bytes(bytes),
             });
         }
 
@@ -1984,7 +2129,7 @@ impl cpu::Vcpu for KvmVcpu {
         self.set_mp_state(state.mp_state.into())?;
         self.set_regs(&state.regs.into())?;
         self.set_sregs(&state.sregs.into())?;
-        self.set_xsave(&state.xsave)?;
+        self.set_xsave(&state.xsave.into())?;
         self.set_xcrs(&state.xcrs)?;
         self.set_lapic(&state.lapic_state)?;
         self.set_fpu(&state.fpu)?;
@@ -2035,7 +2180,9 @@ impl cpu::Vcpu for KvmVcpu {
         // Set system registers
         for reg in &state.sys_regs {
             self.fd
-                .set_one_reg(reg.id, reg.addr.into())
+                .lock()
+                .unwrap()
+                .set_one_reg(reg.id, &reg.addr.to_le_bytes())
                 .map_err(|e| cpu::HypervisorCpuError::SetSysRegister(e.into()))?;
         }
 
@@ -2049,15 +2196,20 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     #[cfg(feature = "tdx")]
     fn tdx_init(&self, hob_address: u64) -> cpu::Result<()> {
-        tdx_command(&self.fd.as_raw_fd(), TdxCommand::InitVcpu, 0, hob_address)
-            .map_err(cpu::HypervisorCpuError::InitializeTdx)
+        tdx_command(
+            &self.fd.lock().unwrap().as_raw_fd(),
+            TdxCommand::InitVcpu,
+            0,
+            hob_address,
+        )
+        .map_err(cpu::HypervisorCpuError::InitializeTdx)
     }
 
     ///
     /// Set the "immediate_exit" state
     ///
     fn set_immediate_exit(&self, exit: bool) {
-        self.fd.set_kvm_immediate_exit(exit.into());
+        self.fd.lock().unwrap().set_kvm_immediate_exit(exit.into());
     }
 
     ///
@@ -2065,8 +2217,15 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     #[cfg(feature = "tdx")]
     fn get_tdx_exit_details(&mut self) -> cpu::Result<TdxExitDetails> {
-        let kvm_run = self.fd.get_kvm_run();
-        let tdx_vmcall = unsafe { &mut kvm_run.__bindgen_anon_1.tdx.u.vmcall };
+        let mut fd = self.fd.as_ref().lock().unwrap();
+        let kvm_run = fd.get_kvm_run();
+        // SAFETY: accessing a union field in a valid structure
+        let tdx_vmcall = unsafe {
+            &mut (*((&mut kvm_run.__bindgen_anon_1) as *mut kvm_run__bindgen_ty_1
+                as *mut KvmTdxExit))
+                .u
+                .vmcall
+        };
 
         tdx_vmcall.status_code = TDG_VP_VMCALL_INVALID_OPERAND;
 
@@ -2088,8 +2247,15 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     #[cfg(feature = "tdx")]
     fn set_tdx_status(&mut self, status: TdxExitStatus) {
-        let kvm_run = self.fd.get_kvm_run();
-        let tdx_vmcall = unsafe { &mut kvm_run.__bindgen_anon_1.tdx.u.vmcall };
+        let mut fd = self.fd.as_ref().lock().unwrap();
+        let kvm_run = fd.get_kvm_run();
+        // SAFETY: accessing a union field in a valid structure
+        let tdx_vmcall = unsafe {
+            &mut (*((&mut kvm_run.__bindgen_anon_1) as *mut kvm_run__bindgen_ty_1
+                as *mut KvmTdxExit))
+                .u
+                .vmcall
+        };
 
         tdx_vmcall.status_code = match status {
             TdxExitStatus::Success => TDG_VP_VMCALL_SUCCESS,
@@ -2129,7 +2295,7 @@ impl cpu::Vcpu for KvmVcpu {
             addr: 0x0,
             flags: 0,
         };
-        self.fd.has_device_attr(&cpu_attr).is_ok()
+        self.fd.lock().unwrap().has_device_attr(&cpu_attr).is_ok()
     }
     #[cfg(target_arch = "aarch64")]
     fn init_pmu(&self, irq: u32) -> cpu::Result<()> {
@@ -2146,9 +2312,13 @@ impl cpu::Vcpu for KvmVcpu {
             flags: 0,
         };
         self.fd
+            .lock()
+            .unwrap()
             .set_device_attr(&cpu_attr_irq)
             .map_err(|_| cpu::HypervisorCpuError::InitializePmu)?;
         self.fd
+            .lock()
+            .unwrap()
             .set_device_attr(&cpu_attr)
             .map_err(|_| cpu::HypervisorCpuError::InitializePmu)
     }
@@ -2159,18 +2329,25 @@ impl KvmVcpu {
     ///
     /// X86 specific call that returns the vcpu's current "xsave struct".
     ///
-    fn get_xsave(&self) -> cpu::Result<Xsave> {
-        self.fd
+    fn get_xsave(&self) -> cpu::Result<XsaveState> {
+        Ok(self
+            .fd
+            .lock()
+            .unwrap()
             .get_xsave()
-            .map_err(|e| cpu::HypervisorCpuError::GetXsaveState(e.into()))
+            .map_err(|e| cpu::HypervisorCpuError::GetXsaveState(e.into()))?
+            .into())
     }
     #[cfg(target_arch = "x86_64")]
     ///
     /// X86 specific call that sets the vcpu's current "xsave struct".
     ///
-    fn set_xsave(&self, xsave: &Xsave) -> cpu::Result<()> {
+    fn set_xsave(&self, xsave: &XsaveState) -> cpu::Result<()> {
+        let xsave: kvm_bindings::kvm_xsave = (*xsave).clone().into();
         self.fd
-            .set_xsave(xsave)
+            .lock()
+            .unwrap()
+            .set_xsave(&xsave)
             .map_err(|e| cpu::HypervisorCpuError::SetXsaveState(e.into()))
     }
     #[cfg(target_arch = "x86_64")]
@@ -2179,6 +2356,8 @@ impl KvmVcpu {
     ///
     fn get_xcrs(&self) -> cpu::Result<ExtendedControlRegisters> {
         self.fd
+            .lock()
+            .unwrap()
             .get_xcrs()
             .map_err(|e| cpu::HypervisorCpuError::GetXcsr(e.into()))
     }
@@ -2188,6 +2367,8 @@ impl KvmVcpu {
     ///
     fn set_xcrs(&self, xcrs: &ExtendedControlRegisters) -> cpu::Result<()> {
         self.fd
+            .lock()
+            .unwrap()
             .set_xcrs(xcrs)
             .map_err(|e| cpu::HypervisorCpuError::SetXcsr(e.into()))
     }
@@ -2198,6 +2379,8 @@ impl KvmVcpu {
     ///
     fn get_vcpu_events(&self) -> cpu::Result<VcpuEvents> {
         self.fd
+            .lock()
+            .unwrap()
             .get_vcpu_events()
             .map_err(|e| cpu::HypervisorCpuError::GetVcpuEvents(e.into()))
     }
@@ -2208,6 +2391,8 @@ impl KvmVcpu {
     ///
     fn set_vcpu_events(&self, events: &VcpuEvents) -> cpu::Result<()> {
         self.fd
+            .lock()
+            .unwrap()
             .set_vcpu_events(events)
             .map_err(|e| cpu::HypervisorCpuError::SetVcpuEvents(e.into()))
     }

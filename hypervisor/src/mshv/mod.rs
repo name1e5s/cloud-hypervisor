@@ -13,7 +13,7 @@ use crate::hypervisor;
 use crate::vec_with_array_field;
 use crate::vm::{self, InterruptSourceConfig, VmOps};
 use crate::HypervisorType;
-pub use mshv_bindings::*;
+use mshv_bindings::*;
 use mshv_ioctls::{set_registers_64, Mshv, NoDatamatch, VcpuFd, VmFd};
 use std::any::Any;
 use std::collections::HashMap;
@@ -446,10 +446,10 @@ impl cpu::Vcpu for MshvVcpu {
                             /* Advance RIP and update RAX */
                             let arr_reg_name_value = [
                                 (
-                                    hv_register_name::HV_X64_REGISTER_RIP,
+                                    hv_register_name_HV_X64_REGISTER_RIP,
                                     info.header.rip + insn_len,
                                 ),
-                                (hv_register_name::HV_X64_REGISTER_RAX, ret_rax),
+                                (hv_register_name_HV_X64_REGISTER_RAX, ret_rax),
                             ];
                             set_registers_64!(self.fd, arr_reg_name_value)
                                 .map_err(|e| cpu::HypervisorCpuError::SetRegister(e.into()))?;
@@ -494,10 +494,10 @@ impl cpu::Vcpu for MshvVcpu {
                     /* Advance RIP and update RAX */
                     let arr_reg_name_value = [
                         (
-                            hv_register_name::HV_X64_REGISTER_RIP,
+                            hv_register_name_HV_X64_REGISTER_RIP,
                             info.header.rip + insn_len,
                         ),
-                        (hv_register_name::HV_X64_REGISTER_RAX, ret_rax),
+                        (hv_register_name_HV_X64_REGISTER_RAX, ret_rax),
                     ];
                     set_registers_64!(self.fd, arr_reg_name_value)
                         .map_err(|e| cpu::HypervisorCpuError::SetRegister(e.into()))?;
