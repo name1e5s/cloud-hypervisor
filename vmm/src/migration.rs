@@ -4,13 +4,12 @@
 
 #[cfg(feature = "guest_debug")]
 use crate::coredump::GuestDebuggableError;
-use crate::{
-    config::VmConfig,
-    vm::{VmSnapshot, VM_SNAPSHOT_ID},
-};
+use crate::vm::VmSnapshot;
+use crate::vm::VM_SNAPSHOT_ID;
+use crate::vm_config::VmConfig;
 use anyhow::anyhow;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::Read;
 use std::path::PathBuf;
 use vm_migration::{MigratableError, Snapshot};
 
@@ -52,10 +51,12 @@ pub fn recv_vm_config(source_url: &str) -> std::result::Result<VmConfig, Migrata
     vm_config_path.push(SNAPSHOT_CONFIG_FILE);
 
     // Try opening the snapshot file
-    let vm_config_file =
-        File::open(vm_config_path).map_err(|e| MigratableError::MigrateSend(e.into()))?;
-    let vm_config_reader = BufReader::new(vm_config_file);
-    serde_json::from_reader(vm_config_reader).map_err(|e| MigratableError::MigrateReceive(e.into()))
+    let mut vm_config_file =
+        File::open(vm_config_path).map_err(|e| MigratableError::MigrateReceive(e.into()))?;
+    let mut bytes = Vec::new();
+    vm_config_file.read_to_end(&mut bytes).unwrap();
+
+    serde_json::from_slice(&bytes).map_err(|e| MigratableError::MigrateReceive(e.into()))
 }
 
 pub fn recv_vm_state(source_url: &str) -> std::result::Result<Snapshot, MigratableError> {
@@ -64,10 +65,12 @@ pub fn recv_vm_state(source_url: &str) -> std::result::Result<Snapshot, Migratab
     vm_state_path.push(SNAPSHOT_STATE_FILE);
 
     // Try opening the snapshot file
-    let vm_state_file =
-        File::open(vm_state_path).map_err(|e| MigratableError::MigrateSend(e.into()))?;
-    let vm_state_reader = BufReader::new(vm_state_file);
-    serde_json::from_reader(vm_state_reader).map_err(|e| MigratableError::MigrateReceive(e.into()))
+    let mut vm_state_file =
+        File::open(vm_state_path).map_err(|e| MigratableError::MigrateReceive(e.into()))?;
+    let mut bytes = Vec::new();
+    vm_state_file.read_to_end(&mut bytes).unwrap();
+
+    serde_json::from_slice(&bytes).map_err(|e| MigratableError::MigrateReceive(e.into()))
 }
 
 pub fn get_vm_snapshot(snapshot: &Snapshot) -> std::result::Result<VmSnapshot, MigratableError> {
@@ -75,9 +78,7 @@ pub fn get_vm_snapshot(snapshot: &Snapshot) -> std::result::Result<VmSnapshot, M
         .snapshot_data
         .get(&format!("{}-section", VM_SNAPSHOT_ID))
     {
-        return serde_json::from_slice(&vm_section.snapshot).map_err(|e| {
-            MigratableError::Restore(anyhow!("Could not deserialize VM snapshot {}", e))
-        });
+        return vm_section.to_state();
     }
 
     Err(MigratableError::Restore(anyhow!(

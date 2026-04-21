@@ -11,8 +11,10 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
-use crate::config::CpusConfig;
-#[cfg(feature = "guest_debug")]
+#[cfg(target_arch = "x86_64")]
+use crate::vm_config::CompatibleMode;
+use crate::vm_config::CpusConfig;
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
     CpuElf64Writable, CpuSegment, CpuState as DumpCpusState, DumpState, Elf64Writable,
     GuestDebuggableError, NoteDescType, X86_64ElfPrStatus, X86_64UserRegs, COREDUMP_NAME_SIZE,
@@ -42,11 +44,12 @@ use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
 use gdbstub_arch::x86::reg::{X86SegmentRegs, X86_64CoreRegs as CoreRegs};
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 use hypervisor::aarch64::StandardRegisters;
-#[cfg(feature = "guest_debug")]
+#[allow(unused_imports)]
+#[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::msr_index;
 #[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::CpuIdEntry;
-#[cfg(feature = "guest_debug")]
+#[cfg(target_arch = "x86_64")]
 use hypervisor::arch::x86::MsrEntry;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use hypervisor::arch::x86::{SpecialRegisters, StandardRegisters};
@@ -292,6 +295,8 @@ pub struct Vcpu {
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
     saved_state: Option<CpuState>,
+    #[cfg(target_arch = "x86_64")]
+    tsc_msrs: Vec<MsrEntry>,
 }
 
 impl Vcpu {
@@ -317,6 +322,8 @@ impl Vcpu {
             #[cfg(target_arch = "aarch64")]
             mpidr: 0,
             saved_state: None,
+            #[cfg(target_arch = "x86_64")]
+            tsc_msrs: Vec::new(),
         })
     }
 
@@ -426,6 +433,23 @@ impl Snapshottable for Vcpu {
             .set_state(&saved_state)
             .map_err(|e| MigratableError::Pause(anyhow!("Could not set the vCPU state {:?}", e)))?;
 
+        // Parse msrs from state, save related msrs in tsc_msrs.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let tsc_msrs: Vec<MsrEntry> = match &saved_state {
+                #[cfg(feature = "kvm")]
+                hypervisor::CpuState::Kvm(inner) => inner
+                    .msrs
+                    .iter()
+                    .filter(|msr| msr.index == msr_index::MSR_IA32_TSC)
+                    .cloned()
+                    .collect(),
+                #[cfg(feature = "mshv")]
+                _ => Vec::new(),
+            };
+            self.tsc_msrs = tsc_msrs;
+        }
+
         self.saved_state = Some(saved_state);
 
         Ok(())
@@ -446,7 +470,7 @@ pub struct CpuManager {
     vcpus_kill_signalled: Arc<AtomicBool>,
     vcpus_pause_signalled: Arc<AtomicBool>,
     exit_evt: EventFd,
-    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+    #[allow(dead_code)]
     reset_evt: EventFd,
     #[cfg(feature = "guest_debug")]
     vm_debug_evt: EventFd,
@@ -460,6 +484,7 @@ pub struct CpuManager {
     proximity_domain_per_cpu: BTreeMap<u8, u32>,
     affinity: BTreeMap<u8, Vec<u8>>,
     dynamic: bool,
+    vcpu_started: Arc<AtomicBool>,
 }
 
 const CPU_ENABLE_FLAG: usize = 0;
@@ -607,6 +632,7 @@ impl CpuManager {
         vm_ops: Arc<dyn VmOps>,
         #[cfg(feature = "tdx")] tdx_enabled: bool,
         numa_nodes: &NumaNodes,
+        vcpu_started: Arc<AtomicBool>,
     ) -> Result<Arc<Mutex<CpuManager>>> {
         let guest_memory = memory_manager.lock().unwrap().guest_memory();
         let mut vcpu_states = Vec::with_capacity(usize::from(config.max_vcpus));
@@ -622,7 +648,14 @@ impl CpuManager {
             .map(|sgx_epc_region| sgx_epc_region.epc_sections().values().cloned().collect());
         #[cfg(target_arch = "x86_64")]
         let cpuid = {
-            let phys_bits = physical_bits(config.max_phys_bits);
+            let phys_bits = physical_bits(config.max_phys_bits, hypervisor.hypervisor_type());
+
+            let (vendor_compatible, arch_compatible) = match config.compatible {
+                CompatibleMode::Vendor => (true, false),
+                CompatibleMode::Max => (true, true),
+                CompatibleMode::Ignore => (false, false),
+            };
+
             arch::generate_common_cpuid(
                 hypervisor,
                 config
@@ -634,6 +667,8 @@ impl CpuManager {
                 config.kvm_hyperv,
                 #[cfg(feature = "tdx")]
                 tdx_enabled,
+                vendor_compatible,
+                arch_compatible,
             )
             .map_err(Error::CommonCpuId)?
         };
@@ -733,6 +768,7 @@ impl CpuManager {
             proximity_domain_per_cpu,
             affinity,
             dynamic,
+            vcpu_started,
         }));
 
         if let Some(acpi_address) = acpi_address {
@@ -835,7 +871,8 @@ impl CpuManager {
         vcpu_thread_barrier: Arc<Barrier>,
         inserting: bool,
     ) -> Result<()> {
-        let reset_evt = self.reset_evt.try_clone().unwrap();
+        // WORKAROUND: force reset event into shutdown.
+        let reset_evt = self.exit_evt.try_clone().unwrap();
         let exit_evt = self.exit_evt.try_clone().unwrap();
         #[cfg(feature = "guest_debug")]
         let vm_debug_evt = self.vm_debug_evt.try_clone().unwrap();
@@ -995,7 +1032,7 @@ impl CpuManager {
                                     VmExit::Ignore => {}
                                     VmExit::Hyperv => {}
                                     VmExit::Reset => {
-                                        info!("VmExit::Reset");
+                                        error!("Shutdown because VmExit::Reset");
                                         vcpu_run_interrupted.store(true, Ordering::SeqCst);
                                         reset_evt.write(1).unwrap();
                                         break;
@@ -1025,13 +1062,6 @@ impl CpuManager {
                                             // is wrong.
                                             unreachable!("Couldn't get a mutable reference from Arc<dyn Vcpu> as there are multiple instances");
                                         }
-                                    }
-                                    _ => {
-                                        error!(
-                                            "VCPU generated error: {:?}",
-                                            Error::UnexpectedVmExit
-                                        );
-                                        break;
                                     }
                                 },
 
@@ -1101,6 +1131,8 @@ impl CpuManager {
             self.start_vcpu(vcpu, vcpu_id, vcpu_thread_barrier.clone(), inserting)?;
         }
 
+        self.vcpu_started.store(true, Ordering::SeqCst);
+
         // Unblock all CPU threads.
         vcpu_thread_barrier.wait();
         Ok(())
@@ -1115,7 +1147,7 @@ impl CpuManager {
 
     fn remove_vcpu(&mut self, cpu_id: u8) -> Result<()> {
         info!("Removing vCPU: cpu_id = {}", cpu_id);
-        let mut state = &mut self.vcpu_states[usize::from(cpu_id)];
+        let state = &mut self.vcpu_states[usize::from(cpu_id)];
         state.kill.store(true, Ordering::SeqCst);
         state.signal_thread();
         state.join_thread()?;
@@ -1696,8 +1728,8 @@ impl Cpu {
             flags: 1 << MADT_CPU_ENABLE_FLAG,
         };
 
-        let mut mat_data: Vec<u8> = Vec::new();
-        mat_data.resize(std::mem::size_of_val(&lapic), 0);
+        let mut mat_data: Vec<u8> = vec![0; std::mem::size_of_val(&lapic)];
+        // SAFETY: mat_data is large enough to hold lapic
         unsafe { *(mat_data.as_mut_ptr() as *mut LocalApic) = lapic };
 
         mat_data
@@ -2081,6 +2113,16 @@ impl Snapshottable for CpuManager {
             info!("Restoring VCPU {}", cpu_id);
             self.create_vcpu(cpu_id.parse::<u8>().unwrap(), None, Some(*snapshot.clone()))
                 .map_err(|e| MigratableError::Restore(anyhow!("Could not create vCPU {:?}", e)))?;
+        }
+
+        // Reset tsc msrs for all vcpu, so that KVM could synchronize TSC
+        // for restored VM, before vcpu run.
+        #[cfg(target_arch = "x86_64")]
+        {
+            for vcpu in &self.vcpus {
+                let vcpu = vcpu.lock().unwrap();
+                let _ = vcpu.vcpu.set_msrs(&vcpu.tsc_msrs);
+            }
         }
 
         Ok(())
