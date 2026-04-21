@@ -201,7 +201,7 @@ pub fn setup_smbios(
             ..Default::default()
         };
         curptr = write_and_incr(mem, smbios_biosinfo, curptr)?;
-        curptr = write_string(mem, "cloud-hypervisor", curptr)?;
+        curptr = write_string(mem, "cube-hypervisor", curptr)?;
         curptr = write_string(mem, "0", curptr)?;
         curptr = write_and_incr(mem, 0u8, curptr)?;
     }
@@ -225,8 +225,8 @@ pub fn setup_smbios(
             ..Default::default()
         };
         curptr = write_and_incr(mem, smbios_sysinfo, curptr)?;
-        curptr = write_string(mem, "Cloud Hypervisor", curptr)?;
-        curptr = write_string(mem, "cloud-hypervisor", curptr)?;
+        curptr = write_string(mem, "Cube Hypervisor", curptr)?;
+        curptr = write_string(mem, "cube-hypervisor", curptr)?;
         if let Some(serial_number) = serial_number {
             curptr = write_string(mem, serial_number, curptr)?;
         }
