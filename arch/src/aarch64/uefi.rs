@@ -1,8 +1,9 @@
 // Copyright 2020 Arm Limited (or its affiliates). All rights reserved.
 
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsFd;
 use std::result;
-use vm_memory::{Bytes, GuestAddress, GuestMemory};
+use vm_memory::{GuestAddress, GuestMemory};
 
 /// Errors thrown while loading UEFI binary
 #[derive(Debug)]
@@ -24,7 +25,7 @@ pub fn load_uefi<F, M: GuestMemory>(
     uefi_image: &mut F,
 ) -> Result<()>
 where
-    F: Read + Seek,
+    F: Read + Seek + AsFd,
 {
     let uefi_size = uefi_image
         .seek(SeekFrom::End(0))
@@ -38,6 +39,6 @@ where
         .seek(SeekFrom::Start(0))
         .map_err(|_| Error::SeekUefiStart)?;
     guest_mem
-        .read_exact_from(guest_addr, uefi_image, uefi_size)
+        .read_exact_volatile_from(guest_addr, &mut uefi_image.as_fd(), uefi_size)
         .map_err(|_| Error::ReadUefiImage)
 }
