@@ -3,25 +3,28 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use crate::api::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdown};
-use crate::api::{ApiError, ApiRequest, VmAction};
+use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmWaitStart, VmmPing, VmmShutdown};
+use crate::api::{ApiError, VmAction};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::{Error as VmmError, Result};
+use core::fmt;
 use hypervisor::HypervisorType;
 use micro_http::{Body, HttpServer, MediaType, Method, Request, Response, StatusCode, Version};
 use once_cell::sync::Lazy;
 use seccompiler::{apply_filter, SeccompAction};
 use serde_json::Error as SerdeError;
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::fs::File;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use vmm_sys_util::eventfd::EventFd;
+
+pub mod http_endpoint;
 
 /// Errors associated with VMM management
 #[derive(Debug)]
@@ -42,6 +45,19 @@ pub enum HttpError {
     ApiError(ApiError),
 }
 
+impl Display for HttpError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::HttpError::*;
+        match self {
+            BadRequest => write!(f, "Bad Request"),
+            NotFound => write!(f, "Not Found"),
+            InternalServerError => write!(f, "Internal Server Error"),
+            SerdeJsonDeserialize(serde_error) => write!(f, "{}", serde_error),
+            ApiError(api_error) => write!(f, "{}", api_error),
+        }
+    }
+}
+
 impl From<serde_json::Error> for HttpError {
     fn from(e: serde_json::Error) -> Self {
         HttpError::SerdeJsonDeserialize(e)
@@ -52,7 +68,7 @@ const HTTP_ROOT: &str = "/api/v1";
 
 pub fn error_response(error: HttpError, status: StatusCode) -> Response {
     let mut response = Response::new(Version::Http11, status);
-    response.set_body(Body::new(format!("{:?}", error)));
+    response.set_body(Body::new(format!("{error}")));
 
     response
 }
@@ -64,20 +80,15 @@ pub trait EndpointHandler {
     /// associated API request down to the VMM API server to e.g. create
     /// or start a VM. The request will block waiting for an answer from the
     /// API server and translate that into an HTTP response.
-    fn handle_request(
-        &self,
-        req: &Request,
-        api_notifier: EventFd,
-        api_sender: Sender<ApiRequest>,
-    ) -> Response {
+    fn handle_request(&self, req: &Request) -> Response {
         // Cloning the files here is very important as it dup() the file
         // descriptors, leaving open the one that was received. This way,
         // rebooting the VM will work since the VM will be created from the
         // original file descriptors.
         let files = req.files.iter().map(|f| f.try_clone().unwrap()).collect();
         let res = match req.method() {
-            Method::Put => self.put_handler(api_notifier, api_sender, &req.body, files),
-            Method::Get => self.get_handler(api_notifier, api_sender, &req.body),
+            Method::Put => self.put_handler(&req.body, files),
+            Method::Get => self.get_handler(&req.body),
             _ => return Response::new(Version::Http11, StatusCode::BadRequest),
         };
 
@@ -101,20 +112,13 @@ pub trait EndpointHandler {
 
     fn put_handler(
         &self,
-        _api_notifier: EventFd,
-        _api_sender: Sender<ApiRequest>,
         _body: &Option<Body>,
         _files: Vec<File>,
     ) -> std::result::Result<Option<Body>, HttpError> {
         Err(HttpError::BadRequest)
     }
 
-    fn get_handler(
-        &self,
-        _api_notifier: EventFd,
-        _api_sender: Sender<ApiRequest>,
-        _body: &Option<Body>,
-    ) -> std::result::Result<Option<Body>, HttpError> {
+    fn get_handler(&self, _body: &Option<Body>) -> std::result::Result<Option<Body>, HttpError> {
         Err(HttpError::BadRequest)
     }
 }
@@ -156,6 +160,10 @@ pub static HTTP_ROUTES: Lazy<HttpRoutes> = Lazy::new(|| {
         Box::new(VmActionHandler::new(VmAction::AddFs(Arc::default()))),
     );
     r.routes.insert(
+        endpoint!("/vm.set-fs"),
+        Box::new(VmActionHandler::new(VmAction::SetFs(Arc::default()))),
+    );
+    r.routes.insert(
         endpoint!("/vm.add-net"),
         Box::new(VmActionHandler::new(VmAction::AddNet(Arc::default()))),
     );
@@ -189,6 +197,12 @@ pub static HTTP_ROUTES: Lazy<HttpRoutes> = Lazy::new(|| {
     r.routes.insert(
         endpoint!("/vm.pause"),
         Box::new(VmActionHandler::new(VmAction::Pause)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.pause2snapshot"),
+        Box::new(VmActionHandler::new(VmAction::PauseToSnapshot(
+            Arc::default(),
+        ))),
     );
     r.routes.insert(
         endpoint!("/vm.power-button"),
@@ -225,6 +239,12 @@ pub static HTTP_ROUTES: Lazy<HttpRoutes> = Lazy::new(|| {
         Box::new(VmActionHandler::new(VmAction::Resume)),
     );
     r.routes.insert(
+        endpoint!("/vm.resume-from-snapshot"),
+        Box::new(VmActionHandler::new(VmAction::ResumeFromSnapshot(
+            Arc::default(),
+        ))),
+    );
+    r.routes.insert(
         endpoint!("/vm.send-migration"),
         Box::new(VmActionHandler::new(
             VmAction::SendMigration(Arc::default()),
@@ -247,24 +267,16 @@ pub static HTTP_ROUTES: Lazy<HttpRoutes> = Lazy::new(|| {
         .insert(endpoint!("/vmm.ping"), Box::new(VmmPing {}));
     r.routes
         .insert(endpoint!("/vmm.shutdown"), Box::new(VmmShutdown {}));
+    r.routes
+        .insert(endpoint!("/vm.waitstart"), Box::new(VmWaitStart {}));
 
     r
 });
 
-fn handle_http_request(
-    request: &Request,
-    api_notifier: &EventFd,
-    api_sender: &Sender<ApiRequest>,
-) -> Response {
+fn handle_http_request(request: &Request) -> Response {
     let path = request.uri().get_abs_path().to_string();
     let mut response = match HTTP_ROUTES.routes.get(&path) {
-        Some(route) => match api_notifier.try_clone() {
-            Ok(notifier) => route.handle_request(request, notifier, api_sender.clone()),
-            Err(_) => error_response(
-                HttpError::InternalServerError,
-                StatusCode::InternalServerError,
-            ),
-        },
+        Some(route) => route.handle_request(request),
         None => error_response(HttpError::NotFound, StatusCode::NotFound),
     };
 
@@ -275,8 +287,6 @@ fn handle_http_request(
 
 fn start_http_thread(
     mut server: HttpServer,
-    api_notifier: EventFd,
-    api_sender: Sender<ApiRequest>,
     seccomp_action: &SeccompAction,
     exit_evt: EventFd,
     hypervisor_type: HypervisorType,
@@ -305,9 +315,9 @@ fn start_http_thread(
                     match server.requests() {
                         Ok(request_vec) => {
                             for server_request in request_vec {
-                                if let Err(e) = server.respond(server_request.process(|request| {
-                                    handle_http_request(request, &api_notifier, &api_sender)
-                                })) {
+                                if let Err(e) =
+                                    server.respond(server_request.process(handle_http_request))
+                                {
                                     error!("HTTP server error on response: {}", e);
                                 }
                             }
@@ -334,20 +344,18 @@ fn start_http_thread(
 
 pub fn start_http_path_thread(
     path: &str,
-    api_notifier: EventFd,
-    api_sender: Sender<ApiRequest>,
+
     seccomp_action: &SeccompAction,
     exit_evt: EventFd,
     hypervisor_type: HypervisorType,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     let socket_path = PathBuf::from(path);
     let socket_fd = UnixListener::bind(socket_path).map_err(VmmError::CreateApiServerSocket)?;
-    let server =
-        HttpServer::new_from_fd(socket_fd.into_raw_fd()).map_err(VmmError::CreateApiServer)?;
+    // SAFETY: Valid FD just opened
+    let server = unsafe { HttpServer::new_from_fd(socket_fd.into_raw_fd()) }
+        .map_err(VmmError::CreateApiServer)?;
     start_http_thread(
         server,
-        api_notifier,
-        api_sender,
         seccomp_action,
         exit_evt,
         hypervisor_type,
@@ -356,17 +364,14 @@ pub fn start_http_path_thread(
 
 pub fn start_http_fd_thread(
     fd: RawFd,
-    api_notifier: EventFd,
-    api_sender: Sender<ApiRequest>,
     seccomp_action: &SeccompAction,
     exit_evt: EventFd,
     hypervisor_type: HypervisorType,
 ) -> Result<thread::JoinHandle<Result<()>>> {
-    let server = HttpServer::new_from_fd(fd).map_err(VmmError::CreateApiServer)?;
+    // SAFETY: Valid FD
+    let server = unsafe { HttpServer::new_from_fd(fd) }.map_err(VmmError::CreateApiServer)?;
     start_http_thread(
         server,
-        api_notifier,
-        api_sender,
         seccomp_action,
         exit_evt,
         hypervisor_type,
