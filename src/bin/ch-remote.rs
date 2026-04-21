@@ -15,6 +15,11 @@ use std::fmt;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::process;
+use vmm::config::RestoreConfig;
+use vmm::vm_config::{
+    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig, VdpaConfig,
+    VsockConfig,
+};
 
 #[derive(Debug)]
 enum Error {
@@ -128,7 +133,7 @@ fn resize_zone_api_command(socket: &mut UnixStream, id: &str, size: &str) -> Res
 }
 
 fn add_device_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
-    let device_config = vmm::config::DeviceConfig::parse(config).map_err(Error::AddDeviceConfig)?;
+    let device_config = DeviceConfig::parse(config).map_err(Error::AddDeviceConfig)?;
 
     simple_api_command(
         socket,
@@ -140,8 +145,7 @@ fn add_device_api_command(socket: &mut UnixStream, config: &str) -> Result<(), E
 }
 
 fn add_user_device_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
-    let device_config =
-        vmm::config::UserDeviceConfig::parse(config).map_err(Error::AddUserDeviceConfig)?;
+    let device_config = UserDeviceConfig::parse(config).map_err(Error::AddUserDeviceConfig)?;
 
     simple_api_command(
         socket,
@@ -165,7 +169,7 @@ fn remove_device_api_command(socket: &mut UnixStream, id: &str) -> Result<(), Er
 }
 
 fn add_disk_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
-    let disk_config = vmm::config::DiskConfig::parse(config).map_err(Error::AddDiskConfig)?;
+    let disk_config = DiskConfig::parse(config).map_err(Error::AddDiskConfig)?;
 
     simple_api_command(
         socket,
@@ -177,7 +181,7 @@ fn add_disk_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Err
 }
 
 fn add_fs_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
-    let fs_config = vmm::config::FsConfig::parse(config).map_err(Error::AddFsConfig)?;
+    let fs_config = FsConfig::parse(config).map_err(Error::AddFsConfig)?;
 
     simple_api_command(
         socket,
@@ -189,7 +193,7 @@ fn add_fs_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error
 }
 
 fn add_pmem_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
-    let pmem_config = vmm::config::PmemConfig::parse(config).map_err(Error::AddPmemConfig)?;
+    let pmem_config = PmemConfig::parse(config).map_err(Error::AddPmemConfig)?;
 
     simple_api_command(
         socket,
@@ -201,7 +205,7 @@ fn add_pmem_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Err
 }
 
 fn add_net_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
-    let mut net_config = vmm::config::NetConfig::parse(config).map_err(Error::AddNetConfig)?;
+    let mut net_config = NetConfig::parse(config).map_err(Error::AddNetConfig)?;
 
     // NetConfig is modified on purpose here by taking the list of file
     // descriptors out. Keeping the list and send it to the server side
@@ -220,7 +224,7 @@ fn add_net_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Erro
 }
 
 fn add_vdpa_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
-    let vdpa_config = vmm::config::VdpaConfig::parse(config).map_err(Error::AddVdpaConfig)?;
+    let vdpa_config = VdpaConfig::parse(config).map_err(Error::AddVdpaConfig)?;
 
     simple_api_command(
         socket,
@@ -232,7 +236,7 @@ fn add_vdpa_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Err
 }
 
 fn add_vsock_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
-    let vsock_config = vmm::config::VsockConfig::parse(config).map_err(Error::AddVsockConfig)?;
+    let vsock_config = VsockConfig::parse(config).map_err(Error::AddVsockConfig)?;
 
     simple_api_command(
         socket,
@@ -258,12 +262,38 @@ fn snapshot_api_command(socket: &mut UnixStream, url: &str) -> Result<(), Error>
 }
 
 fn restore_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
-    let restore_config = vmm::config::RestoreConfig::parse(config).map_err(Error::Restore)?;
+    let restore_config = RestoreConfig::parse(config).map_err(Error::Restore)?;
 
     simple_api_command(
         socket,
         "PUT",
         "restore",
+        Some(&serde_json::to_string(&restore_config).unwrap()),
+    )
+    .map_err(Error::ApiClient)
+}
+
+fn pause2snapshot_api_command(socket: &mut UnixStream, url: &str) -> Result<(), Error> {
+    let snapshot_config = vmm::api::VmSnapshotConfig {
+        destination_url: String::from(url),
+    };
+
+    simple_api_command(
+        socket,
+        "PUT",
+        "pause2snapshot",
+        Some(&serde_json::to_string(&snapshot_config).unwrap()),
+    )
+    .map_err(Error::ApiClient)
+}
+
+fn resume_from_snap_api_command(socket: &mut UnixStream, config: &str) -> Result<(), Error> {
+    let restore_config = RestoreConfig::parse(config).map_err(Error::Restore)?;
+
+    simple_api_command(
+        socket,
+        "PUT",
+        "resume-from-snapshot",
         Some(&serde_json::to_string(&restore_config).unwrap()),
     )
     .map_err(Error::ApiClient)
@@ -457,6 +487,22 @@ fn do_command(matches: &ArgMatches) -> Result<(), Error> {
                 .get_one::<String>("restore_config")
                 .unwrap(),
         ),
+        Some("pause2snapshot") => pause2snapshot_api_command(
+            &mut socket,
+            matches
+                .subcommand_matches("pause2snapshot")
+                .unwrap()
+                .get_one::<String>("snapshot_config")
+                .unwrap(),
+        ),
+        Some("resume-from-snapshot") => resume_from_snap_api_command(
+            &mut socket,
+            matches
+                .subcommand_matches("resume-from-snapshot")
+                .unwrap()
+                .get_one::<String>("restore_config")
+                .unwrap(),
+        ),
         Some("coredump") => coredump_api_command(
             &mut socket,
             matches
@@ -514,40 +560,28 @@ fn main() {
             Command::new("add-device").about("Add VFIO device").arg(
                 Arg::new("device_config")
                     .index(1)
-                    .help(vmm::config::DeviceConfig::SYNTAX),
+                    .help(DeviceConfig::SYNTAX),
             ),
         )
         .subcommand(
-            Command::new("add-disk").about("Add block device").arg(
-                Arg::new("disk_config")
-                    .index(1)
-                    .help(vmm::config::DiskConfig::SYNTAX),
-            ),
+            Command::new("add-disk")
+                .about("Add block device")
+                .arg(Arg::new("disk_config").index(1).help(DiskConfig::SYNTAX)),
         )
         .subcommand(
             Command::new("add-fs")
                 .about("Add virtio-fs backed fs device")
-                .arg(
-                    Arg::new("fs_config")
-                        .index(1)
-                        .help(vmm::config::FsConfig::SYNTAX),
-                ),
+                .arg(Arg::new("fs_config").index(1).help(FsConfig::SYNTAX)),
         )
         .subcommand(
             Command::new("add-pmem")
                 .about("Add persistent memory device")
-                .arg(
-                    Arg::new("pmem_config")
-                        .index(1)
-                        .help(vmm::config::PmemConfig::SYNTAX),
-                ),
+                .arg(Arg::new("pmem_config").index(1).help(PmemConfig::SYNTAX)),
         )
         .subcommand(
-            Command::new("add-net").about("Add network device").arg(
-                Arg::new("net_config")
-                    .index(1)
-                    .help(vmm::config::NetConfig::SYNTAX),
-            ),
+            Command::new("add-net")
+                .about("Add network device")
+                .arg(Arg::new("net_config").index(1).help(NetConfig::SYNTAX)),
         )
         .subcommand(
             Command::new("add-user-device")
@@ -555,22 +589,18 @@ fn main() {
                 .arg(
                     Arg::new("device_config")
                         .index(1)
-                        .help(vmm::config::UserDeviceConfig::SYNTAX),
+                        .help(UserDeviceConfig::SYNTAX),
                 ),
         )
         .subcommand(
-            Command::new("add-vdpa").about("Add vDPA device").arg(
-                Arg::new("vdpa_config")
-                    .index(1)
-                    .help(vmm::config::VdpaConfig::SYNTAX),
-            ),
+            Command::new("add-vdpa")
+                .about("Add vDPA device")
+                .arg(Arg::new("vdpa_config").index(1).help(VdpaConfig::SYNTAX)),
         )
         .subcommand(
-            Command::new("add-vsock").about("Add vsock device").arg(
-                Arg::new("vsock_config")
-                    .index(1)
-                    .help(vmm::config::VsockConfig::SYNTAX),
-            ),
+            Command::new("add-vsock")
+                .about("Add vsock device")
+                .arg(Arg::new("vsock_config").index(1).help(VsockConfig::SYNTAX)),
         )
         .subcommand(
             Command::new("remove-device")
@@ -639,7 +669,25 @@ fn main() {
                 .arg(
                     Arg::new("restore_config")
                         .index(1)
-                        .help(vmm::config::RestoreConfig::SYNTAX),
+                        .help(RestoreConfig::SYNTAX),
+                ),
+        )
+        .subcommand(
+            Command::new("pause2snapshot")
+                .about("Pause and create a snapshot from VM")
+                .arg(
+                    Arg::new("snapshot_config")
+                        .index(1)
+                        .help("<destination_url>"),
+                ),
+        )
+        .subcommand(
+            Command::new("resume-from-snapshot")
+                .about("Resume VM from a snapshot")
+                .arg(
+                    Arg::new("restore_config")
+                        .index(1)
+                        .help(RestoreConfig::SYNTAX),
                 ),
         )
         .subcommand(
